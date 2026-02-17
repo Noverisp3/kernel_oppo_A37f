@@ -19,6 +19,9 @@
 #ifdef CONFIG_ZRAM_LZ4_COMPRESS
 #include "zcomp_lz4.h"
 #endif
+#ifdef CONFIG_ZRAM_CINNAMON_COMPRESS
+#include "zcomp_cinnamon.h"
+#endif
 
 /*
  * single zcomp_strm backend
@@ -45,8 +48,8 @@ struct zcomp_strm_multi {
 
 static struct zcomp_backend *backends[] = {
 	&zcomp_lzo,
-#ifdef CONFIG_ZRAM_LZ4_COMPRESS
-	&zcomp_lz4,
+#ifdef CONFIG_ZRAM_CINNAMON_COMPRESS
+	&zcomp_cinnamon,
 #endif
 	NULL
 };

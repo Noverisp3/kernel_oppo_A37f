@@ -1480,8 +1480,9 @@ void opchg_check_status(struct opchg_charger *chip)
     opchg_get_charging_status(chip);
     opchg_get_prop_charge_type(chip);
 
+    opchg_get_prop_fastcharger_type(chip);  // Always call for fast charge support
+
     #ifdef OPPO_USE_2CHARGER
-    opchg_get_prop_fastcharger_type(chip);
     opchg_get_prop_fastcharger_status(chip);
     #endif
     chip->bat_temp_status = opchg_get_prop_batt_health(chip);
@@ -1511,6 +1512,7 @@ void opchg_check_status(struct opchg_charger *chip)
 
 void opchg_set_status(struct opchg_charger *chip,bool input_curr_set)
 {
+
     opchg_set_wdt_reset(chip);
 
     #ifdef OPPO_USE_2CHARGER

@@ -18,13 +18,24 @@ config SUSPEND_FREEZER
 
 	  Turning OFF this setting is NOT recommended! If in doubt, say Y.
 
-config HAS_WAKELOCK
-	bool
-	default y
-
 config WAKELOCK
 	bool
 	default y
+
+config CINNAMON_DELAY_TRIGGER
+	bool "Cinnamon Delay Trigger - Delayed Command Execution"
+	depends on PM
+	default y
+	---help---
+	  Enable Cinnamon Delay Trigger for executing power management
+	  commands after a specified delay. This provides:
+	  - 60 second delayed execution mechanism
+	  - Placeholder command execution framework
+	  - Proc interface for status and control
+	  - Clean integration with kernel power subsystem
+	  
+	  Say Y if you want delayed command execution for power
+	  management optimization.
 
 config HIBERNATE_CALLBACKS
 	bool

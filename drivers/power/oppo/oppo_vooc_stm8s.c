@@ -54,7 +54,7 @@ static bool stm8s_fw_check(struct opchg_fast_charger *chip)
 	//first:set address
 	rc = i2c_smbus_write_i2c_block_data(chip->client,0x01,2,&addr_buf[0]);
 	if(rc < 0){
-		pr_err("%s i2c_write 0x01 error\n",__func__);
+		pr_debug("%s i2c_write 0x01 error\n",__func__);
 		goto i2c_err;
 	}
 	msleep(10);
@@ -69,14 +69,13 @@ static bool stm8s_fw_check(struct opchg_fast_charger *chip)
 			if(addr == ((vooc_firmware_data[fw_line * 34 + 1] << 8) | vooc_firmware_data[fw_line * 34]))
 			{
 				if(data_buf[0] != vooc_firmware_data[fw_line * 34 + 2]){
-					pr_err("%s fail,data_buf[0]:0x%x != vooc_firmware_data[%d]:0x%x\n",__func__,
+					pr_debug("%s fail,data_buf[0]:0x%x != vooc_firmware_data[%d]:0x%x\n",__func__,
 							data_buf[0],(fw_line * 34 + 2),vooc_firmware_data[fw_line * 34 + 2]);
-					pr_err("%s addr = 0x%x,%x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",__func__,addr,
+					pr_debug("%s addr = 0x%x,%x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",__func__,addr,
 							data_buf[0],data_buf[1],data_buf[2],data_buf[3],data_buf[4],data_buf[5],data_buf[6],data_buf[7],
 							data_buf[8],data_buf[9],data_buf[10],data_buf[11],data_buf[12],data_buf[13],data_buf[14],
 							data_buf[15],data_buf[16],data_buf[17],data_buf[18],data_buf[19],data_buf[20],data_buf[21],data_buf[22],
-							data_buf[23],data_buf[24],data_buf[25],data_buf[26],data_buf[27],data_buf[28],data_buf[29],data_buf[30],
-							data_buf[31]);
+							data_buf[23],data_buf[24],data_buf[25],data_buf[26],data_buf[27],data_buf[28],data_buf[29],data_buf[30],data_buf[31]);
 					return FW_CHECK_FAIL;
 				}
 				fw_line++;
@@ -87,7 +86,7 @@ static bool stm8s_fw_check(struct opchg_fast_charger *chip)
 				{
 					for(j = 0;j < 32;j++){
 						if(data_buf[j] != vooc_firmware_data[fw_line * 34 + 2 + j]){
-							pr_err("%s fail,data_buf[%d]:0x%x != vooc_firmware_data[%d]:0x%x\n",__func__,
+							pr_debug("%s fail,data_buf[%d]:0x%x != vooc_firmware_data[%d]:0x%x\n",__func__,
 								j,data_buf[j],(fw_line * 34 + 2 + j),vooc_firmware_data[fw_line * 34 + 2 + j]);
 							return FW_CHECK_FAIL;
 						}
@@ -316,8 +315,9 @@ static int stm8s_probe(struct i2c_client *client, const struct i2c_device_id *id
     struct opchg_fast_charger *chip;
 
 	/**/
-	if (vooc_get_mcu_hw_type() != OPCHG_VOOC_STM8S_ID)
-		return 0;
+	// Comment out hardware type check for USB Fast Charge bypass
+	// if (vooc_get_mcu_hw_type() != OPCHG_VOOC_STM8S_ID)
+	//	return 0;
 
 	chip = devm_kzalloc(&client->dev, sizeof(*chip), GFP_KERNEL);
     if (!chip) {
@@ -349,10 +349,11 @@ static int stm8s_probe(struct i2c_client *client, const struct i2c_device_id *id
         return retval;
     }
 	/**/
-	if(!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
-		pr_err("%s stm8s_probe,i2c_func error\n",__func__);
-		goto err_check_functionality_failed;
-	}
+	// Comment out I2C functionality check for USB Fast Charge bypass
+	// if(!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+	//	pr_err("%s stm8s_probe,i2c_func error\n",__func__);
+	//	goto err_check_functionality_failed;
+	// }
 
 	/**/
     chip->opchg_fast_driver_id = id->driver_data;
@@ -394,7 +395,6 @@ err_set_vtg_i2c:
 			regulator_set_voltage(chip->vcc_i2c, 0, OPCHARGER_I2C_VTG_MAX_UV);
 		}
 
-err_check_functionality_failed:
 	pr_err("%s is fail\n",__func__);
 	return 0;
 }

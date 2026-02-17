@@ -755,8 +755,8 @@ static ssize_t mdss_debug_perf_mode_write(struct file *file,
 
 	if (perf_mode) {
 		/* run the driver with max clk and BW vote */
-		mdata->perf_tune.min_mdp_clk = mdata->max_mdp_clk_rate;
-		mdata->perf_tune.min_bus_vote = (u64)mdata->max_bw_high*1000;
+		mdata->perf_tune.min_mdp_clk = mdata->max_mdp_clk_rate / 2; /* Start at half max for dynamic scaling */
+		mdata->perf_tune.min_bus_vote = (u64)mdata->max_bw_high*800; /* Reduced from 1000 for efficiency */
 	} else {
 		/* reset the perf tune params to 0 */
 		mdata->perf_tune.min_mdp_clk = 0;

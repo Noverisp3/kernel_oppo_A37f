@@ -15,7 +15,94 @@
 #define OPPO_CHARGER_PAR
 #include "oppo_inc.h"
 
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+
 bool is_gt1x_tp_charger =false;
+
+extern struct opchg_charger *opchg_chip; /* Battery charger chip */
+
+int force_fast_charge = 1; /* 0 = disabled, 1 = enabled (default) */
+static int thermal_disabled = 0; /* 1 = disabled due to high temperature */
+static int thermal_protection_enabled = 1; /* 0 = disabled, 1 = enabled (default) */
+
+#define USB_FAST_CHARGE_DANGEROUS_TEMP 450  /* 45°C */
+#define USB_FAST_CHARGE_SAFE_TEMP 400       /* 40°C */
+
+static ssize_t force_fast_charge_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", force_fast_charge);
+}
+
+static ssize_t thermal_protection_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", thermal_protection_enabled);
+}
+
+static ssize_t thermal_protection_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int val;
+
+	if (sscanf(buf, "%d", &val) != 1)
+		return -EINVAL;
+
+	if (val < 0 || val > 1)
+		return -EINVAL;
+
+	thermal_protection_enabled = val;
+	return count;
+}
+
+static ssize_t force_fast_charge_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int val;
+
+	if (sscanf(buf, "%d", &val) != 1)
+		return -EINVAL;
+
+	force_fast_charge = val ? 1 : 0;
+	return count;
+}
+
+static struct kobj_attribute force_fast_charge_attr = __ATTR(force_fast_charge, 0644, force_fast_charge_show, force_fast_charge_store);
+static struct kobj_attribute thermal_protection_attr = __ATTR(thermal_protection, 0644, thermal_protection_show, thermal_protection_store);
+
+static struct kobject *fast_charge_kobj;
+
+static int __init oppo_charger_sysfs_init(void)
+{
+	int retval;
+
+	fast_charge_kobj = kobject_create_and_add("fast_charge", kernel_kobj);
+	if (!fast_charge_kobj)
+		return -ENOMEM;
+
+	retval = sysfs_create_file(fast_charge_kobj, &force_fast_charge_attr.attr);
+	if (retval)
+		goto err;
+
+	retval = sysfs_create_file(fast_charge_kobj, &thermal_protection_attr.attr);
+	if (retval)
+		goto err;
+
+	return retval;
+
+err:
+	kobject_put(fast_charge_kobj);
+	return retval;
+}
+
+static void __exit oppo_charger_sysfs_exit(void)
+{
+	if (fast_charge_kobj) {
+		sysfs_remove_file(fast_charge_kobj, &force_fast_charge_attr.attr);
+		sysfs_remove_file(fast_charge_kobj, &thermal_protection_attr.attr);
+		kobject_put(fast_charge_kobj);
+	}
+}
+
+subsys_initcall(oppo_charger_sysfs_init);
+module_exit(oppo_charger_sysfs_exit);
 
 static int __opchg_read_reg(struct opchg_charger *chip, u8 reg, u8 *val)
 {
@@ -418,10 +505,9 @@ int opchg_regulator_init(struct opchg_charger *chip)
 	return rc;
 }
 
-#ifdef OPPO_USE_2CHARGER
 void opchg_get_prop_fastcharger_type(struct opchg_charger *chip)
 {
-    int rc = false;
+	int rc = 0;
 
     if (chip->suspending) {
 		return;
@@ -437,16 +523,30 @@ void opchg_get_prop_fastcharger_type(struct opchg_charger *chip)
 		break;
 
 	case OPCHG_BQ24196_ID:
-		//
+		// BQ24196 Fast Charge: Force higher current limits
+		if (force_fast_charge && (!thermal_protection_enabled || !thermal_disabled)) {
+			dev_info(chip->dev, "USB Fast Charge: BQ24196 forcing higher current limits\n");
+			// Force input current to 1.5A and fast charge current to max
+			opchg_set_input_chg_current(chip, 1500, false);
+			opchg_set_fast_chg_current(chip, chip->fastchg_current_max_ma);
+		}
 		break;
 
     default:
         break;
     }
 
+    /* USB Fast Charge: Enable fast charger type for DCP when forced and thermal safe */
+    if (!rc && force_fast_charge && (!thermal_protection_enabled || !thermal_disabled) &&
+        qpnp_charger_type_get(chip) == POWER_SUPPLY_TYPE_USB_DCP) {
+        rc = true;
+    } else if (!rc) {
+    }
+
     chip->fastcharger_type = rc;
+
+    dev_info(chip->dev, "USB Fast Charge: fastcharger_type SET to %d (was %d)\n", rc, chip->fastcharger_type);
 }
-#endif
 
 void opchg_get_prop_charge_type(struct opchg_charger *chip)
 {
@@ -724,27 +824,27 @@ void opchg_set_prechg_current(struct opchg_charger *chip, int ipre_mA)
 }
 
 
-void opchg_set_input_chg_current(struct opchg_charger *chip, int mA, bool aicl)
+void opchg_set_input_chg_current(struct opchg_charger *chip, int current_ma, bool aicl)
 {
+
     switch (chip->driver_id) {
     case OPCHG_SMB358_ID:
-        smb358_set_input_chg_current(chip, mA, aicl);
+        smb358_set_input_chg_current(chip, current_ma, aicl);
         break;
-
 	case OPCHG_SMB1357_ID:
-		smb1357_set_input_chg_current(chip, mA, aicl);
+		smb1357_set_input_chg_current(chip, current_ma, aicl);
 		break;
 
 	case OPCHG_BQ24196_ID:
-		bq24196_set_input_chg_current(chip, mA, aicl);
+		bq24196_set_input_chg_current(chip, current_ma, aicl);
 		break;
 
 	case OPCHG_BQ24157_ID:
-		bq24157_set_input_chg_current(chip, mA, aicl);
+		bq24157_set_input_chg_current(chip, current_ma, aicl);
 		break;
 
 	case OPCHG_BQ24188_ID:
-		bq24188_set_input_chg_current(chip, mA, aicl);
+		bq24188_set_input_chg_current(chip, current_ma, aicl);
 		break;
 
     default:
@@ -845,8 +945,7 @@ void opchg_set_charging_disable(struct opchg_charger *chip, bool disable)
 
 	case OPCHG_SMB1357_ID:
 		smb1357_set_charging_disable(chip, disable);
-		//opchg_read_reg(chip, REG42_SMB1357_ADDRESS, &reg);
-		//pr_err("oppo charging reg42= %d\n", reg);
+		/* Cinnamon: Removed debug spam */
 		break;
 
 	case OPCHG_BQ24196_ID:
@@ -1132,16 +1231,20 @@ void opchg_usbin_valid_irq_handler(bool usb_present)
 {
 	is_gt1x_tp_charger =usb_present;
 	if(!opchg_chip){
-		pr_err("%s opchg_chip is NULL,return\n",__func__);
+		pr_debug("%s opchg_chip is NULL,return\n",__func__);
 		return;
 	}
 	else
 	{
-		pr_err("%s opchg_chip->driver_id=%d,opchg_chip->chg_present=%d,usb_present=%d\n",__func__,opchg_chip->driver_id,opchg_chip->chg_present,usb_present);
+		/* Cinnamon: Reduced debug spam - only log when really needed */
+		if (opchg_chip->driver_id != OPCHG_BQ24196_ID) {
+			pr_debug("%s opchg_chip->driver_id=%d,opchg_chip->chg_present=%d,usb_present=%d\n",__func__,opchg_chip->driver_id,opchg_chip->chg_present,usb_present);
+		}
 	}
 
 	if(opchg_get_prop_fast_chg_started(opchg_chip) == true){
-		pr_err("%s fast chg started,return\n",__func__);
+		/* Cinnamon: Reduced fast charging spam */
+		pr_debug("%s fast chg started,return\n",__func__);
 		return ;
 	}
 
@@ -1256,6 +1359,35 @@ int qpnp_charger_type_get(struct opchg_charger *chip)
 
 	chip->usb_psy->get_property(chip->usb_psy,
 				  POWER_SUPPLY_PROP_TYPE, &ret);
+
+	/* Thermal safety for USB Fast Charge - only if protection enabled */
+	if (thermal_protection_enabled && opchg_chip) {
+    if (opchg_chip->temperature > USB_FAST_CHARGE_DANGEROUS_TEMP) {
+        /* High temperature detected - disable USB Fast Charge */
+        if (thermal_disabled == 0) {
+            thermal_disabled = 1;
+            dev_warn(chip->dev, "USB Fast Charge: Disabled due to high temperature %d°C\n",
+                 opchg_chip->temperature / 10);
+        }
+    } else if (opchg_chip->temperature < USB_FAST_CHARGE_SAFE_TEMP) {
+        /* Temperature back to safe level - allow re-enable */
+        if (thermal_disabled == 1) {
+            thermal_disabled = 0;
+            dev_info(chip->dev, "USB Fast Charge: Re-enabled (temperature %d°C)\n",
+                 opchg_chip->temperature / 10);
+        }
+    }
+}	else {
+		/* Thermal protection disabled */
+		thermal_disabled = 0;
+	}
+
+	/* Force USB Fast Charge if enabled via sysfs and thermal safe */
+	if (force_fast_charge && !thermal_disabled &&
+	    (ret.intval == POWER_SUPPLY_TYPE_USB ||
+	     ret.intval == POWER_SUPPLY_TYPE_USB_CDP)) {
+		ret.intval = POWER_SUPPLY_TYPE_USB_DCP;
+	}
 
 	return ret.intval;
 }

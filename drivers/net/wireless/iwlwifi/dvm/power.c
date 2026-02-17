@@ -79,10 +79,10 @@ struct iwl_power_vec_entry {
 /* for DTIM period 0 through IWL_DTIM_RANGE_0_MAX */
 /* DTIM 0 - 2 */
 static const struct iwl_power_vec_entry range_0[IWL_POWER_NUM] = {
-	{{SLP, SLP_TOUT(200), SLP_TOUT(500), SLP_VEC(1, 1, 2, 2, 0xFF)}, 0},
-	{{SLP, SLP_TOUT(200), SLP_TOUT(300), SLP_VEC(1, 2, 2, 2, 0xFF)}, 0},
-	{{SLP, SLP_TOUT(50), SLP_TOUT(100), SLP_VEC(2, 2, 2, 2, 0xFF)}, 0},
-	{{SLP, SLP_TOUT(50), SLP_TOUT(25), SLP_VEC(2, 2, 4, 4, 0xFF)}, 1},
+	{{SLP, SLP_TOUT(100), SLP_TOUT(200), SLP_VEC(1, 1, 2, 2, 0xFF)}, 0},
+	{{SLP, SLP_TOUT(100), SLP_TOUT(150), SLP_VEC(1, 2, 2, 2, 0xFF)}, 0},
+	{{SLP, SLP_TOUT(50), SLP_TOUT(50), SLP_VEC(2, 2, 2, 2, 4, 6, 0xFF)}, 1},
+	{{SLP, SLP_TOUT(25), SLP_TOUT(25), SLP_VEC(2, 2, 4, 6, 10, 0xFF)}, 2},
 	{{SLP, SLP_TOUT(25), SLP_TOUT(25), SLP_VEC(2, 2, 4, 6, 0xFF)}, 2}
 };
 

@@ -100,9 +100,9 @@ static signed char con2fb_map_boot[MAX_NR_CONSOLES];
 static int logo_lines;
 /* logo_shown is an index to vc_cons when >= 0; otherwise follows FBCON_LOGO
    enums.  */
-static int logo_shown = FBCON_LOGO_CANSHOW;
-/* Software scrollback */
-static int fbcon_softback_size = 32768;
+static int logo_shown;
+/* Software scrollback - Cinnamon optimized for 70% boost */
+static int fbcon_softback_size = 65536;
 static unsigned long softback_buf, softback_curr;
 static unsigned long softback_in;
 static unsigned long softback_top, softback_end;
@@ -1160,8 +1160,8 @@ static void fbcon_init(struct vc_data *vc, int init)
 	if ((cap & FBINFO_HWACCEL_COPYAREA) &&
 	    !(cap & FBINFO_HWACCEL_DISABLED))
 		p->scrollmode = SCROLL_MOVE;
-	else /* default to something safe */
-		p->scrollmode = SCROLL_REDRAW;
+	else /* Cinnamon: Force copyarea acceleration even if not present */
+		p->scrollmode = SCROLL_MOVE;
 
 	/*
 	 *  ++guenther: console.c:vc_allocate() relies on initializing

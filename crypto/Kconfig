@@ -1444,4 +1444,13 @@ config CRYPTO_USER_API_SKCIPHER
 source "drivers/crypto/Kconfig"
 source crypto/asymmetric_keys/Kconfig
 
+config CRYPTO_CINNAMON
+	tristate "Cinnamon XOR-Rotate checksum algorithm"
+	select CRYPTO_HASH
+	help
+	  This option enables the Cinnamon fast checksum algorithm.
+	  Cinnamon uses XOR-Rotate operations for ultra-fast integrity checking,
+	  optimized for embedded systems and real-time workloads.
+	  Provides both standalone checksum functions and crypto API integration.
+
 endif	# if CRYPTO

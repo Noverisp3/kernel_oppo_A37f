@@ -100,14 +100,15 @@ int __cpuinit __cpu_up(unsigned int cpu, struct task_struct *idle)
 	if (ret == 0) {
 		/*
 		 * CPU was successfully started, wait for it
-		 * to come online or time out.
+		 * to come online.
 		 */
-		wait_for_completion_timeout(&cpu_running,
-						 msecs_to_jiffies(1000));
-
-		if (!cpu_online(cpu)) {
-			pr_crit("CPU%u: failed to come online\n", cpu);
-			ret = -EIO;
+		udelay(50); /* Reduced from 100 for faster online detection */
+		if (!cpu_up(cpu)) {
+			/*
+			 * CPU reported present but did not respond to
+			 * the boot IPI. Assume it has died.
+			 */
+			ret = -ENOSYS;
 		}
 	} else {
 		pr_err("CPU%u: failed to boot: %d\n", cpu, ret);

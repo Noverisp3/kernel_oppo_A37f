@@ -58,6 +58,7 @@ static enum power_supply_property pm_power_props_mains[] = {
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 };
 
 static void opchg_external_power_changed(struct power_supply *psy)
@@ -577,7 +578,8 @@ int opchg_battery_get_property(struct power_supply *psy,
 			}
 			else
 			{
-				chip->fastcharger =0;
+				// For BQ24196 and other non-VOOC chargers, use fastcharger_type for fast charging detection
+				chip->fastcharger = chip->fastcharger_type;
 			}
 			#else
 			chip->fastcharger =0;
@@ -714,6 +716,10 @@ int qpnp_power_get_property_mains(struct power_supply *psy,
 		{
 			val->intval = chip->max_input_current[INPUT_CURRENT_MIN] * 1000;
 		}
+		break;
+
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		val->intval = chip->charger_vol * 1000; /* Convert to microvolts */
 		break;
 
 	default:

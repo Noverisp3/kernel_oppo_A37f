@@ -141,7 +141,7 @@ static inline int kmem_cache_debug(struct kmem_cache *s)
  * Mininum number of partial slabs. These will be left on the partial
  * lists even if they are empty. kmem_cache_shrink may reclaim them.
  */
-#define MIN_PARTIAL 5
+#define MIN_PARTIAL 10
 
 /*
  * Maximum number of desirable partial slabs.

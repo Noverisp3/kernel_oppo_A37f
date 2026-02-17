@@ -15,20 +15,13 @@ config ZRAM
 
 	  See zram.txt for more information.
 
-config ZRAM_LZ4_COMPRESS
-	bool "Enable LZ4 algorithm support"
+config ZRAM_CINNAMON_COMPRESS
+	bool "Enable Cinnamon algorithm support"
 	depends on ZRAM
-	select LZ4_COMPRESS
-	select LZ4_DECOMPRESS
-	default n
 	help
-	  This option enables LZ4 compression algorithm support. Compression
-	  algorithm can be changed using `comp_algorithm' device attribute.
+	  This option enables Cinnamon compression algorithm support.
+	  Cinnamon is a frame-based compression optimized for Android workloads
+	  with minimal CPU overhead and L1 cache locality. It provides adaptive
+	  compression based on I/O pressure from Cinnamon I/O scheduler.
 
-config ZRAM_DEBUG
-	bool "Compressed RAM block device debug support"
-	depends on ZRAM
-	default n
-	help
-	  This option adds additional debugging code to the compressed
-	  RAM block device driver.
+	  Compression algorithm can be changed using `comp_algorithm' device attribute.
