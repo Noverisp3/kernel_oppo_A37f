@@ -35,6 +35,10 @@
 
 #include "zram_drv.h"
 
+#ifdef CONFIG_ZRAM_CINNAMON_COMPRESS
+#include "zcomp_cinnamon.h"
+#endif
+
 /* Globals */
 static int zram_major;
 static struct zram *zram_devices;
@@ -1255,6 +1259,9 @@ static int __init zram_init(void)
 	}
 
 	pr_info("Created %u device(s)\n", num_devices);
+#ifdef CONFIG_ZRAM_CINNAMON_COMPRESS
+	cinnamon_proc_init();
+#endif
 	return 0;
 
 out_error:
@@ -1265,6 +1272,9 @@ out_error:
 static void __exit zram_exit(void)
 {
 	destroy_devices(num_devices);
+#ifdef CONFIG_ZRAM_CINNAMON_COMPRESS
+	cinnamon_proc_exit();
+#endif
 }
 
 module_init(zram_init);
