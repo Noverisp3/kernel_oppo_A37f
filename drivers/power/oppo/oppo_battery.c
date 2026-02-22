@@ -1500,13 +1500,6 @@ void opchg_check_status(struct opchg_charger *chip)
 		count_debug = 0;
 		soc_temp = chip->bat_volt_check_point;
 		soc_bms_temp = chip->soc_bms;
-
-		pr_debug("oppo_charging_status	batt_temp=%d,batt_vol=%d,batt_soc=%d,chg_current=%d,chg_vol=%d, is_factory_mode=%d,fastcharger_sign= %d,\
-		chip->batterynotify=0x%x,chip->batt_pre_full=%d,chip->batt_full=%d,chg_type=%d,usb_online= %d,chg_time_out=%d,chg_total_time=%d,\
-		bat_temp_status=%d,charging_status= %d,charger_status=%d,chip->is_charging=%d,soc_cal=%d,ocv=%d,auth=%d\r\n",
-		chip->temperature,chip->bat_instant_vol/1000,chip->bat_volt_check_point,chip->charging_current,chip->charger_vol,chip->is_factory_mode,chip->fastcharger,
-		chip->batterynotify,chip->batt_pre_full,chip->batt_full,chip->charger_type,chip->chg_present,chip->charging_time_out,chip->charging_total_time,
-		chip->charging_opchg_temp_statu,chip->bat_status,chip->bat_charging_state,chip->is_charging,chip->soc_bms,chip->ocv_uv/1000,chip->batt_authen);
 	}
 }
 

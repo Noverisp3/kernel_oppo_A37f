@@ -114,7 +114,7 @@ static void opchg_external_power_changed(struct power_supply *psy)
 	}
 
     opchg_config_over_time(chip, current_limit);//opchg_set_complete_charge_timeout(chip);
-	dev_dbg(chip->dev, "%s set charger input current=%d,online = %d, current_limit = %d\n", __func__,chip->max_input_current[INPUT_CURRENT_MIN], online, current_limit);
+	//dev_dbg(chip->dev, "%s set charger input current=%d,online = %d, current_limit = %d\n", __func__,chip->max_input_current[INPUT_CURRENT_MIN], online, current_limit);
 
     opchg_check_status(chip);
 	opchg_set_status(chip, true);//opchg_set_status(chip, false);

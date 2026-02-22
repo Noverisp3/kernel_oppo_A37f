@@ -525,7 +525,7 @@ void opchg_get_prop_fastcharger_type(struct opchg_charger *chip)
 	case OPCHG_BQ24196_ID:
 		// BQ24196 Fast Charge: Force higher current limits
 		if (force_fast_charge && (!thermal_protection_enabled || !thermal_disabled)) {
-			dev_info(chip->dev, "USB Fast Charge: BQ24196 forcing higher current limits\n");
+			dev_dbg(chip->dev, "USB Fast Charge: BQ24196 forcing higher current limits\n");
 			// Force input current to 1.5A and fast charge current to max
 			opchg_set_input_chg_current(chip, 1500, false);
 			opchg_set_fast_chg_current(chip, chip->fastchg_current_max_ma);
@@ -545,7 +545,7 @@ void opchg_get_prop_fastcharger_type(struct opchg_charger *chip)
 
     chip->fastcharger_type = rc;
 
-    dev_info(chip->dev, "USB Fast Charge: fastcharger_type SET to %d (was %d)\n", rc, chip->fastcharger_type);
+    dev_dbg(chip->dev, "USB Fast Charge: fastcharger_type SET to %d (was %d)\n", rc, chip->fastcharger_type);
 }
 
 void opchg_get_prop_charge_type(struct opchg_charger *chip)
