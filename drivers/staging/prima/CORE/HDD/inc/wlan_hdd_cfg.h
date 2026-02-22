@@ -216,17 +216,17 @@
 #define CFG_IMPS_MINIMUM_SLEEP_TIME_NAME       "gImpsMinSleepTime" 
 #define CFG_IMPS_MINIMUM_SLEEP_TIME_MIN        ( 0 )
 #define CFG_IMPS_MINIMUM_SLEEP_TIME_MAX        ( 65535 )
-#define CFG_IMPS_MINIMUM_SLEEP_TIME_DEFAULT    ( 5 )
+#define CFG_IMPS_MINIMUM_SLEEP_TIME_DEFAULT    ( 1 )
     
 #define CFG_IMPS_MODERATE_SLEEP_TIME_NAME      "gImpsModSleepTime"
 #define CFG_IMPS_MODERATE_SLEEP_TIME_MIN       ( 0 )
 #define CFG_IMPS_MODERATE_SLEEP_TIME_MAX       ( 65535 )
-#define CFG_IMPS_MODERATE_SLEEP_TIME_DEFAULT   ( 10)
+#define CFG_IMPS_MODERATE_SLEEP_TIME_DEFAULT   ( 2)
 
 #define CFG_IMPS_MAXIMUM_SLEEP_TIME_NAME       "gImpsMaxSleepTime"
 #define CFG_IMPS_MAXIMUM_SLEEP_TIME_MIN        ( 0 )
 #define CFG_IMPS_MAXIMUM_SLEEP_TIME_MAX        ( 65535 )
-#define CFG_IMPS_MAXIMUM_SLEEP_TIME_DEFAULT    ( 15 )
+#define CFG_IMPS_MAXIMUM_SLEEP_TIME_DEFAULT    ( 5 )
 
 /*If there is scan on STA interface back to back with
  *time diff nDeferScanTimeInterval, driver will not
@@ -236,7 +236,7 @@
 #define CFG_DEFER_SCAN_TIME_INTERVAL            "gDeferScanTimeInterval"
 #define CFG_DEFER_SCAN_TIME_INTERVAL_MIN        ( 0 )
 #define CFG_DEFER_SCAN_TIME_INTERVAL_MAX        ( 65535 )
-#define CFG_DEFER_SCAN_TIME_INTERVAL_DEFAULT    ( 2000  )
+#define CFG_DEFER_SCAN_TIME_INTERVAL_DEFAULT    ( 500  )
 
 //BMPS = BeaconModePowerSave
 #define CFG_ENABLE_BMPS_NAME                   "gEnableBmps"
@@ -2398,7 +2398,7 @@ static __inline tANI_U32 defHddRateToDefCfgRate( tANI_U32 defRateIndex )
 #define CFG_PNO_SCAN_SUPPORT_DEFAULT                 ( 1 )
 
 #define CFG_PNO_SCAN_TIMER_REPEAT_VALUE              "gPNOScanTimerRepeatValue"
-#define CFG_PNO_SCAN_TIMER_REPEAT_VALUE_DEFAULT      ( 6 )
+#define CFG_PNO_SCAN_TIMER_REPEAT_VALUE_DEFAULT      ( 150 )
 #define CFG_PNO_SCAN_TIMER_REPEAT_VALUE_MIN          ( 0 )
 #define CFG_PNO_SCAN_TIMER_REPEAT_VALUE_MAX          ( 0xffffffff )
 #endif
@@ -3134,6 +3134,15 @@ This feature requires the dependent cfg.ini "gRoamPrefer5GHz" set to 1 */
 #define CFG_TRIGGER_NULLFRAME_BEFORE_HB_MIN        (0)
 #define CFG_TRIGGER_NULLFRAME_BEFORE_HB_MAX        (1)
 #define CFG_TRIGGER_NULLFRAME_BEFORE_HB_DEFAULT    (0)
+
+/*
+ * gEnableModulatedDTIM: Enable modulated DTIM for power efficiency
+ * 1: Enable, 2: Advanced mode
+ */
+#ifndef CFG_ENABLE_MODULATED_DTIM_DEFAULT
+#define CFG_ENABLE_MODULATED_DTIM_NAME       "gEnableModulatedDTIM"
+#define CFG_ENABLE_MODULATED_DTIM_DEFAULT    (1)
+#endif
 
 /*
  * If enabled ecsa will be used to switch channel to force scc else SAP
