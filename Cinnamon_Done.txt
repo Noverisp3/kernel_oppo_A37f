@@ -16,7 +16,7 @@ Phát hiện tính năng sạc nhanh không hoạt động nên đã để yên 
 
 Tiếp tục cải thiện zRAM với chế độ nén phân tầng
 
-Không nén phân tầng nữa, chúng ta sẽ tạo riêng một compression engine cho zRAM để sync với Cinamon I/O và Cinamon Kernel
+Đã tinh chỉnh Cinnamon I/O scheduler: giảm write expire từ 250ms xuống 125ms, giảm pressure threshold từ 32 xuống 24 để tăng throughput và giảm latency.
 
 Đã hoàn thành hệ sinh thái CIO (Cinnamon IO) và CCompress (Cinnamon Compress) và CCrypto (Cinnamon Crypto). Đang chờ lỗi
 
@@ -73,3 +73,9 @@ Chuẩn bị hoàn thiện vòng loop và hệ sinh thái Cinnamon
 Đã integrate zRAM.sh vào Cinnamon Delay Trigger: thay thế placeholder commands với zRAM setup sequence (cleanup, compression setup, VM/scheduler optimization), cập nhật proc interface descriptions, module description. zRAM setup giờ execute sau 60 giây delay.
 
 Đã rename zRAM setup thành Cinnamon_Active và implement actual command execution: thay thế placeholder comments với actual kernel file operations (filp_open, vfs_write), call_usermodehelper cho mkswap/swapon, real VM/sysfs writes. Cinnamon_Active giờ thực sự execute commands thay vì chỉ log.
+
+Đã implement Cinnamon I/O Scheduler tối ưu: Zero-Alloc (không kmalloc), Anti-Starvation (ghi không treo >125ms), Smart Batching (động áp lực I/O), Dynamic Read-Ahead (ra_pages theo pressure), Hysteresis (smooth áp lực), Per-Queue State (SMP safe), Latency Monitoring (avg latency sysfs), Moving Average (smooth stats).
+
+Đã implement Cinnamon Compression Engine: Branchless Zero Check (OR-based), Pressure Switch (skip match load cao), Compiler Hints (likely/unlikely), Prefetching (cache ahead), 4 Prev Blocks (ring buffer), 3-Bit Header (encode indices), Local Counters (batch atomic), Proc Monitoring (/proc/ccompress stats/ratio).
+
+Đã tinh chỉnh wakelock GC để tránh lag resume: tăng WL_GC_TIME_SEC từ 150s lên 250s, WL_GC_COUNT_MAX từ 50 lên 80 để giảm frequency GC spikes.

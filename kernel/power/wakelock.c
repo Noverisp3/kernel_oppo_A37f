@@ -78,8 +78,8 @@ static inline void decrement_wakelocks_number(void) {}
 #endif /* CONFIG_PM_WAKELOCKS_LIMIT */
 
 #ifdef CONFIG_PM_WAKELOCKS_GC
-#define WL_GC_COUNT_MAX	50 /* Cinnamon: Reduced from 100 for faster GC */
-#define WL_GC_TIME_SEC	150 /* Cinnamon: Reduced from 300s for faster cleanup */
+#define WL_GC_COUNT_MAX	80 /* Cinnamon: Reduced from 100 for faster GC */
+#define WL_GC_TIME_SEC	250 /* Increased back from 150s to reduce GC spikes */
 
 static LIST_HEAD(wakelocks_lru_list);
 static unsigned int wakelocks_gc_count;
