@@ -97,3 +97,4 @@ x509.genkey
 
 # Generated source files
 smd_rpc_sym.c
+drivers/staging/prima/Module.symvers
