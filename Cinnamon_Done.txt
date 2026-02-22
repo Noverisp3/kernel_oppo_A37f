@@ -79,3 +79,13 @@ Chuẩn bị hoàn thiện vòng loop và hệ sinh thái Cinnamon
 Đã implement Cinnamon Compression Engine: Branchless Zero Check (OR-based), Pressure Switch (skip match load cao), Compiler Hints (likely/unlikely), Prefetching (cache ahead), 4 Prev Blocks (ring buffer), 3-Bit Header (encode indices), Local Counters (batch atomic), Proc Monitoring (/proc/ccompress stats/ratio).
 
 Đã tinh chỉnh wakelock GC để tránh lag resume: tăng WL_GC_TIME_SEC từ 150s lên 250s, WL_GC_COUNT_MAX từ 50 lên 80 để giảm frequency GC spikes.
+
+Đã tuning Wi-Fi listen interval xuống 2 trong Qualcomm Prima driver: chỉnh CFG_BMPS_MINIMUM_LI_DEFAULT từ 1 lên 2 để wake up mỗi 2 beacon intervals (~200ms) check data, balance giữa responsiveness và power.
+
+Đã tối ưu hóa Race to Sleep: giảm IMPS sleep times (min 1s, moderate 2s, max 5s), giảm defer scan time 500ms, enable modulated DTIM default 1 để CPU xử lý nhanh và sleep sâu, giảm lag on/off screen.
+
+Đã tuning PNO (Preferred Network Offload): tăng CFG_PNO_SCAN_TIMER_REPEAT_VALUE từ 6s lên 150s để giãn chu kỳ scan khi screen off, tiết kiệm pin và vẫn auto-connect Wi-Fi quen thuộc.
+
+Đã cấu hình aggressive CPU hotplug với delayed work 5 giây: khi màn hình tắt, offline 3 CPUs xuống còn 1, set min/max freq to 400MHz, disable task-based onlining (task_thres=0), pin current task to CPU0, log sleep duration; khi bật màn hình, online lại 4 CPUs, restore freq, log resume. Sử dụng fb notifier và workqueues để defer operations, tránh race conditions.
+
+Đã tối ưu C-states hybrid: CPU0 dùng clock gating cho responsiveness ngắn hạn, offline CPUs dùng power collapse để tiết kiệm điện tối đa khi screen off.

@@ -172,7 +172,7 @@ void msm_cpu_postboot(void)
 	 */
 	write_pen_release(INVALID_HWID);
 
-	msm_spm_set_low_power_mode(MSM_SPM_MODE_CLOCK_GATING, false);
+	msm_spm_set_low_power_mode(MSM_SPM_MODE_CLOCK_GATING, true);
 
 	/*
 	 * Synchronise with the boot thread.
@@ -191,6 +191,7 @@ static void msm_wfi_cpu_die(unsigned int cpu)
 	}
 	for (;;) {
 		lpm_cpu_hotplug_enter(cpu);
+		msm_spm_set_low_power_mode(MSM_SPM_MODE_POWER_COLLAPSE, true);
 		if (secondary_holding_pen_release == cpu_logical_map(cpu)) {
 			/*Proper wake up */
 			break;

@@ -41,6 +41,11 @@
 #include <linux/sched.h>
 #include <soc/qcom/core_ctl.h>
 #include <linux/mutex.h>
+#include <linux/fb.h>
+#include <linux/notifier.h>
+#include <linux/cpufreq.h>
+#include <linux/workqueue.h>
+#include <linux/cpu.h>
 
 #include <trace/events/power.h>
 
@@ -81,6 +86,7 @@ struct cpu_data {
 	struct task_struct *hotplug_thread;
 	struct kobject kobj;
 	struct list_head pending_lru;
+	bool is_locked;
 };
 
 static DEFINE_PER_CPU(struct cpu_data, cpu_state);
@@ -88,10 +94,147 @@ static DEFINE_SPINLOCK(state_lock);
 static DEFINE_SPINLOCK(pending_lru_lock);
 static DEFINE_MUTEX(lru_lock);
 
-static void apply_need(struct cpu_data *f);
+static unsigned int default_min_freq[NR_CPUS];
+static unsigned int default_max_freq[NR_CPUS];
+static struct work_struct screen_on_work;
+static struct delayed_work screen_off_work;
+static bool screen_off_active = false;
+static unsigned long sleep_start_jiffies;
+
 static void wake_up_hotplug_thread(struct cpu_data *state);
-static void add_to_pending_lru(struct cpu_data *state);
-static void update_lru(struct cpu_data *state);
+static void apply_need(struct cpu_data *f);
+
+static void screen_on_work_func(struct work_struct *work)
+{
+	int cpu;
+	struct cpufreq_policy *policy;
+	int restored_mhz = 0;
+	int curr_min_mhz;
+
+	/* Restore default min freq on screen on */
+	if (!screen_off_active) {
+		for_each_online_cpu(cpu) {
+			policy = cpufreq_cpu_get(cpu);
+			if (policy) {
+				policy->min = default_min_freq[cpu];
+				policy->max = default_max_freq[cpu];
+				cpufreq_update_policy(cpu);
+				curr_min_mhz = policy->min / 1000;
+				if (curr_min_mhz > restored_mhz) restored_mhz = curr_min_mhz;
+				cpufreq_cpu_put(policy);
+			}
+		}
+		pr_info("CSleep: Screen on detected! Resuming from slow state\n");
+		if (sleep_start_jiffies) {
+			if (jiffies >= sleep_start_jiffies) {
+				unsigned long sleep_duration_ms = jiffies_to_msecs(jiffies - sleep_start_jiffies);
+				pr_info("CSleep: CPU was in slow state for %lu s\n", sleep_duration_ms / 1000);
+			} else {
+				pr_info("CSleep: Slow state duration error\n");
+			}
+			sleep_start_jiffies = 0;
+		}
+	}
+
+	/* Re-enable hotplug after screen on */
+	cpu_hotplug_enable();
+}
+
+static void screen_off_work_func(struct work_struct *work)
+{
+	int cpu;
+	struct cpufreq_policy *policy;
+	int low_mhz = 0;
+	int i;
+
+	/* Force to 1 CPU legally */
+	for (i = 0; i < NR_CPUS; i++) {
+		struct cpu_data *f = &per_cpu(cpu_state, i);
+		if (!f->inited || f->first_cpu != i)
+			continue;
+		f->max_cpus = 1;
+		f->min_cpus = 1;
+		f->is_locked = 1;
+		wake_up_hotplug_thread(f);
+	}
+
+	/* Disable hotplug to prevent other cores from coming online */
+	cpu_hotplug_disable();
+
+	/* Pin current task to CPU0 to ensure CPU0 stays online */
+	{
+		cpumask_t mask;
+		cpumask_clear(&mask);
+		cpumask_set_cpu(0, &mask);
+		set_cpus_allowed_ptr(current, &mask);
+	}
+
+	/* Set low min freq on screen off */
+	if (screen_off_active) {
+		for_each_online_cpu(cpu) {
+			policy = cpufreq_cpu_get(cpu);
+			if (policy) {
+				default_min_freq[cpu] = policy->min;
+				default_max_freq[cpu] = policy->max;
+				policy->min = 200000;
+				policy->max = 200000;
+				cpufreq_update_policy(cpu);
+				if (policy->min < low_mhz || low_mhz == 0)
+					low_mhz = policy->min / 1000;
+				cpufreq_cpu_put(policy);
+			}
+		}
+		pr_info("CSleep: Screen off detected! Slowing down CPU to %d MHz\n", low_mhz);
+		sleep_start_jiffies = jiffies;
+	}
+}
+
+static int screen_state_cb(struct notifier_block *nb, unsigned long val, void *data)
+{
+	struct fb_event *evdata = data;
+	unsigned int blank;
+	int i;
+
+	if (val != FB_EVENT_BLANK)
+		return 0;
+
+	blank = *(int *)evdata->data;
+
+	for (i = 0; i < NR_CPUS; i++) {
+		struct cpu_data *f = &per_cpu(cpu_state, i);
+		if (!f->inited || f->first_cpu != i)
+			continue;
+
+		if (blank == FB_BLANK_UNBLANK) {
+			/* Screen on: allow up to 4 CPUs */
+			f->max_cpus = f->num_cpus;
+			f->min_cpus = 1;
+			f->task_thres = UINT_MAX; // Restore task-based onlining
+			f->is_locked = 0; // Unlock to allow other drivers to change
+			screen_off_active = false;
+			cancel_delayed_work_sync(&screen_off_work); // Hủy lệnh hạ xung nếu người dùng bật lại nhanh
+			/* Defer restore default min freq */
+			schedule_work(&screen_on_work);
+		} else {
+			/* Screen off: force to 1 CPU */
+			f->max_cpus = 1;
+			f->min_cpus = 1;
+			f->need_cpus = 1;
+			f->task_thres = 0; // Prevent onlining extra CPUs based on tasks
+			f->is_locked = 1; // Lock to prevent other drivers from interfering
+			screen_off_active = true;
+			/* Defer set low min freq after 5 seconds */
+			schedule_delayed_work(&screen_off_work, msecs_to_jiffies(5000));
+		}
+		wake_up_hotplug_thread(f);
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block screen_nb = {
+	.notifier_call = screen_state_cb,
+};
 
 /* ========================= sysfs interface =========================== */
 
@@ -99,6 +242,9 @@ static ssize_t store_min_cpus(struct cpu_data *state,
 				const char *buf, size_t count)
 {
 	unsigned int val;
+
+	if (state->is_locked)
+		return -EPERM;
 
 	if (sscanf(buf, "%u\n", &val) != 1)
 		return -EINVAL;
@@ -118,6 +264,9 @@ static ssize_t store_max_cpus(struct cpu_data *state,
 				const char *buf, size_t count)
 {
 	unsigned int val;
+
+	if (state->is_locked)
+		return -EPERM;
 
 	if (sscanf(buf, "%u\n", &val) != 1)
 		return -EINVAL;
@@ -714,6 +863,10 @@ static void __ref do_hotplug(struct cpu_data *f)
 			if (f->online_cpus == need)
 				break;
 
+			/* Don't offline CPU0 */
+			if (c->cpu == 0)
+				continue;
+
 			/* Don't offline busy CPUs. */
 			if (c->is_busy)
 				continue;
@@ -736,6 +889,10 @@ static void __ref do_hotplug(struct cpu_data *f)
 
 			if (f->online_cpus <= f->max_cpus)
 				break;
+
+			/* Don't offline CPU0 */
+			if (c->cpu == 0)
+				continue;
 
 			pr_debug("Trying to Offline CPU%u\n", c->cpu);
 			if (cpu_down(c->cpu))
@@ -967,6 +1124,7 @@ static int group_init(struct cpumask *mask)
 	spin_lock_init(&f->pending_lock);
 	f->timer.function = core_ctl_timer_func;
 	f->timer.data = first_cpu;
+	f->is_locked = false;
 
 	for_each_cpu(cpu, mask) {
 		pr_info("Init CPU%u state\n", cpu);
@@ -1054,6 +1212,20 @@ static int __init core_ctl_init(void)
 	}
 	core_ctl_unblock_hotplug();
 	mod_timer(&rq_avg_timer, round_to_nw_start());
+
+	/* Initialize default_min_freq with current min freq */
+	for_each_possible_cpu(cpu) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+		if (policy) {
+			default_min_freq[cpu] = policy->min;
+			default_max_freq[cpu] = policy->max;
+			cpufreq_cpu_put(policy);
+		}
+	}
+
+	fb_register_client(&screen_nb);
+	INIT_WORK(&screen_on_work, screen_on_work_func);
+	INIT_DELAYED_WORK(&screen_off_work, screen_off_work_func);
 	return 0;
 }
 
@@ -1066,6 +1238,8 @@ static void __exit core_ctl_exit(void)
 	cpufreq_unregister_notifier(&cpufreq_pol_nb, CPUFREQ_POLICY_NOTIFIER);
 	cpufreq_unregister_notifier(&cpufreq_gov_nb, CPUFREQ_GOVINFO_NOTIFIER);
 	del_timer_sync(&rq_avg_timer);
+
+	fb_unregister_client(&screen_nb);
 
 	for_each_possible_cpu(cpu) {
 		pcpu = &per_cpu(cpu_state, cpu);

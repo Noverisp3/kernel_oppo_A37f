@@ -61,6 +61,7 @@ static void cinnamon_update_ra(struct cinnamon_data *cd, struct request_queue *q
 	if (curr_press != cd->last_ra_pressure) {
 		unsigned int ra_kb;
 		if (curr_press == 3) ra_kb = 128;
+		else if (curr_press == 0) ra_kb = 4096; /* Max read-ahead for Race to Sleep */
 		else if (curr_press <= 1) ra_kb = 2048;
 		else ra_kb = 512;
 		{
