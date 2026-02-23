@@ -30,6 +30,8 @@
 #include <linux/tick.h>
 #include <trace/events/power.h>
 
+extern int freq_locked;
+
 /**
  * The "cpufreq driver" - the arch- or hardware-dependent low
  * level driver of CPUFreq support, and its spinlock. This lock
@@ -453,6 +455,9 @@ static ssize_t store_##file_name					\
 	ret = cpufreq_driver->verify(&new_policy);			\
 	if (ret)							\
 		pr_err("cpufreq: Frequency verification failed\n");	\
+									\
+	if (freq_locked && !strcmp(#file_name, "scaling_min_freq"))	\
+		return -EPERM;						\
 									\
 	policy->user_policy.min = new_policy.min;			\
 	policy->user_policy.max = new_policy.max;			\

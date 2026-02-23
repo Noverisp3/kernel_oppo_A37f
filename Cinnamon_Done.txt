@@ -89,3 +89,5 @@ Chuẩn bị hoàn thiện vòng loop và hệ sinh thái Cinnamon
 Đã cấu hình aggressive CPU hotplug với delayed work 5 giây: khi màn hình tắt, offline 3 CPUs xuống còn 1, set min/max freq to 400MHz, disable task-based onlining (task_thres=0), pin current task to CPU0, log sleep duration; khi bật màn hình, online lại 4 CPUs, restore freq, log resume. Sử dụng fb notifier và workqueues để defer operations, tránh race conditions.
 
 Đã tối ưu C-states hybrid: CPU0 dùng clock gating cho responsiveness ngắn hạn, offline CPUs dùng power collapse để tiết kiệm điện tối đa khi screen off.
+
+Đã triển khai CPU hotplug và frequency scaling cho CSleep trên Snapdragon 400: freeze CPU frequency 400-800MHz, offline tất cả CPUs trừ CPU0 khi screen off, stop charger update thread để tránh wake nếu đang sạc và pin >=10%, enable hotplug và restore frequency khi screen on, log sleep duration, fix compilation errors, multiple definitions và include paths.

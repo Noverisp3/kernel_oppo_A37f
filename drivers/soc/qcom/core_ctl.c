@@ -40,14 +40,19 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <soc/qcom/core_ctl.h>
-#include <linux/mutex.h>
-#include <linux/fb.h>
-#include <linux/notifier.h>
 #include <linux/cpufreq.h>
 #include <linux/workqueue.h>
 #include <linux/cpu.h>
-
+#include <linux/cpumask.h>
+#include <linux/module.h>
+#include <linux/pm.h>
+#include <linux/fb.h>
+#include <linux/notifier.h>
 #include <trace/events/power.h>
+#include "../../power/oppo/oppo_inc.h"
+
+extern struct cpufreq_governor cpufreq_gov_powersave;
+extern struct cpufreq_governor cpufreq_gov_interactive;
 
 #define MAX_CPUS_PER_GROUP 4
 
@@ -100,6 +105,7 @@ static struct work_struct screen_on_work;
 static struct delayed_work screen_off_work;
 static bool screen_off_active = false;
 static unsigned long sleep_start_jiffies;
+int freq_locked = 0;
 
 static void wake_up_hotplug_thread(struct cpu_data *state);
 static void apply_need(struct cpu_data *f);
@@ -108,46 +114,61 @@ static void screen_on_work_func(struct work_struct *work)
 {
 	int cpu;
 	struct cpufreq_policy *policy;
-	int restored_mhz = 0;
-	int curr_min_mhz;
+	int i;
 
-	/* Restore default min freq on screen on */
-	if (!screen_off_active) {
-		for_each_online_cpu(cpu) {
-			policy = cpufreq_cpu_get(cpu);
-			if (policy) {
-				policy->min = default_min_freq[cpu];
-				policy->max = default_max_freq[cpu];
-				cpufreq_update_policy(cpu);
-				curr_min_mhz = policy->min / 1000;
-				if (curr_min_mhz > restored_mhz) restored_mhz = curr_min_mhz;
-				cpufreq_cpu_put(policy);
-			}
-		}
-		pr_info("CSleep: Screen on detected! Resuming from slow state\n");
-		if (sleep_start_jiffies) {
-			if (jiffies >= sleep_start_jiffies) {
-				unsigned long sleep_duration_ms = jiffies_to_msecs(jiffies - sleep_start_jiffies);
-				pr_info("CSleep: CPU was in slow state for %lu s\n", sleep_duration_ms / 1000);
-			} else {
-				pr_info("CSleep: Slow state duration error\n");
-			}
-			sleep_start_jiffies = 0;
+	/* Mở khóa CPU Hotplug trước */
+	cpu_hotplug_enable();
+
+	/* Giải phóng dải tần số */
+	freq_locked = 0;
+	for_each_online_cpu(cpu) {
+		policy = cpufreq_cpu_get(cpu);
+		if (policy) {
+			/* Trả lại thông số mặc định đã lưu trong core_ctl_init */
+			policy->user_policy.min = default_min_freq[cpu];
+			policy->user_policy.max = default_max_freq[cpu];
+			policy->min = default_min_freq[cpu];
+			policy->max = default_max_freq[cpu];
+
+			cpufreq_update_policy(cpu);
+			cpufreq_cpu_put(policy);
 		}
 	}
+	pr_info("CSleep: Screen on detected! Governor Unfrozen.\n");
+	if (sleep_start_jiffies) {
+		if (jiffies >= sleep_start_jiffies) {
+			unsigned long sleep_duration_ms = jiffies_to_msecs(jiffies - sleep_start_jiffies);
+			pr_info("CSleep: CPU was in sleep state for %lu s\n", sleep_duration_ms / 1000);
+		} else {
+			pr_info("CSleep: Sleep state duration error\n");
+		}
+		sleep_start_jiffies = 0;
+	}
 
-	/* Re-enable hotplug after screen on */
-	cpu_hotplug_enable();
+	/* Khôi phục cài đặt Hotplug để các nhân khác có thể online */
+	for (i = 0; i < NR_CPUS; i++) {
+		struct cpu_data *f = &per_cpu(cpu_state, i);
+		if (!f->inited || f->first_cpu != i)
+			continue;
+		f->max_cpus = NR_CPUS;
+		f->min_cpus = 1;
+		f->is_locked = 0;
+		wake_up_hotplug_thread(f);
+	}
+
+	/* Restart charger update thread */
+	if (opchg_chip) {
+		schedule_delayed_work(&opchg_chip->update_opchg_thread_work, msecs_to_jiffies(100));
+	}
 }
 
 static void screen_off_work_func(struct work_struct *work)
 {
-	int cpu;
-	struct cpufreq_policy *policy;
-	int low_mhz = 0;
 	int i;
+	struct cpufreq_policy *policy;
+	unsigned int cpu = 0; // Tập trung khóa CPU0 vì đây là nhân duy nhất được giữ lại
 
-	/* Force to 1 CPU legally */
+	/* 1. Force hệ thống chỉ dùng 1 nhân (CPU0) */
 	for (i = 0; i < NR_CPUS; i++) {
 		struct cpu_data *f = &per_cpu(cpu_state, i);
 		if (!f->inited || f->first_cpu != i)
@@ -158,33 +179,30 @@ static void screen_off_work_func(struct work_struct *work)
 		wake_up_hotplug_thread(f);
 	}
 
-	/* Disable hotplug to prevent other cores from coming online */
 	cpu_hotplug_disable();
 
-	/* Pin current task to CPU0 to ensure CPU0 stays online */
-	{
-		cpumask_t mask;
-		cpumask_clear(&mask);
-		cpumask_set_cpu(0, &mask);
-		set_cpus_allowed_ptr(current, &mask);
-	}
-
-	/* Set low min freq on screen off */
+	/* 2. Thực hiện đóng băng dải tần của Governor */
 	if (screen_off_active) {
-		for_each_online_cpu(cpu) {
-			policy = cpufreq_cpu_get(cpu);
-			if (policy) {
-				default_min_freq[cpu] = policy->min;
-				default_max_freq[cpu] = policy->max;
-				policy->min = 200000;
-				policy->max = 200000;
-				cpufreq_update_policy(cpu);
-				if (policy->min < low_mhz || low_mhz == 0)
-					low_mhz = policy->min / 1000;
-				cpufreq_cpu_put(policy);
-			}
+		freq_locked = 1;
+		policy = cpufreq_cpu_get(cpu);
+		if (policy) {
+			/* Khóa Min ở mức 400MHz, Max ở mức 800MHz */
+			policy->user_policy.min = 400000;
+			policy->user_policy.max = 800000;
+			policy->min = 400000;
+			policy->max = 800000;
+
+			/* Ép Driver thực thi ngay lập tức */
+			__cpufreq_driver_target(policy, 400000, CPUFREQ_RELATION_H);
+			cpufreq_update_policy(cpu);
+			cpufreq_cpu_put(policy);
 		}
-		pr_info("CSleep: Screen off detected! Slowing down CPU to %d MHz\n", low_mhz);
+
+		/* Stop charger update thread to prevent wake */
+		if (opchg_chip && opchg_chip->is_charging && opchg_chip->bat_volt_check_point >= 10) {
+			cancel_delayed_work_sync(&opchg_chip->update_opchg_thread_work);
+		}
+		pr_info("CSleep: Screen off detected! Governor Frozen at 400-800MHz\n");
 		sleep_start_jiffies = jiffies;
 	}
 }
@@ -1258,3 +1276,5 @@ module_exit(core_ctl_exit);
 
 MODULE_DESCRIPTION("MSM Core Control Driver");
 MODULE_LICENSE("GPL v2");
+
+EXPORT_SYMBOL(freq_locked);
