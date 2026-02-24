@@ -109,8 +109,8 @@ static struct work_struct screen_on_work;
 static struct delayed_work screen_off_work;
 static bool screen_off_active = false;
 static unsigned long sleep_start_jiffies;
-int freq_locked = 0;
-#define sleep_state freq_locked
+int sleep_state = 0;
+#define freq_locked sleep_state
 
 static DEFINE_MUTEX(core_ctl_mutex);
 static atomic_t hotplug_refcount = ATOMIC_INIT(0);
