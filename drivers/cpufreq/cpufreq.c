@@ -30,7 +30,7 @@
 #include <linux/tick.h>
 #include <trace/events/power.h>
 
-extern int freq_locked;
+extern int sleep_state;
 
 /**
  * The "cpufreq driver" - the arch- or hardware-dependent low
@@ -456,7 +456,7 @@ static ssize_t store_##file_name					\
 	if (ret)							\
 		pr_err("cpufreq: Frequency verification failed\n");	\
 									\
-	if (freq_locked && !strcmp(#file_name, "scaling_min_freq"))	\
+	if (sleep_state && !strcmp(#file_name, "scaling_min_freq"))	\
 		return -EPERM;						\
 									\
 	policy->user_policy.min = new_policy.min;			\
