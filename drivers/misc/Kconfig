@@ -635,4 +635,9 @@ source "drivers/misc/altera-stapl/Kconfig"
 source "drivers/misc/mei/Kconfig"
 source "drivers/misc/vmw_vmci/Kconfig"
 source "drivers/misc/qcom/Kconfig"
+config CCOLORCAL
+	tristate "CColorCal - Cinnamon Color Calibration"
+	default n
+	help
+	  This option enables CColorCal, a custom KCAL-compatible color calibration module optimized for Oppo A37.
 endmenu
