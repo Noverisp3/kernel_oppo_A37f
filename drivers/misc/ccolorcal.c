@@ -1,4 +1,4 @@
-/* This file is Experiments and has been disabled*/
+/* This file is a Prototype and has been disabled (can re-enable if needed but not work yet) */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
