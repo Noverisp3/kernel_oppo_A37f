@@ -25,6 +25,7 @@ extern atomic_t cinnamon_io_pressure;
 extern atomic_t cinnamon_pages_compressed;
 extern atomic_t cinnamon_zero_blocks;
 extern atomic_t cinnamon_match_blocks;
+extern atomic_t cinnamon_delta_blocks;
 extern atomic_t cinnamon_raw_blocks;
 
 /* Proc entry functions */
