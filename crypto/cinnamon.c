@@ -1,5 +1,5 @@
 /*
- * crypto/cinnamon.c - Cinnamon Crypto Module (Fixed & Optimized)
+ * crypto/cinnamon.c - Cinnamon Crypto Module
  */
 
 #include <linux/kernel.h>
@@ -7,9 +7,6 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <asm/unaligned.h> /* Rất quan trọng để chống Alignment Fault */
-#include <linux/proc_fs.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
 
 #include "cinnamon.h"
 
@@ -17,45 +14,8 @@
 #define CINNAMON_ROTATE_BITS 13 
 #define CINNAMON_ZERO_CONSTANT 0x5A5A5A5A5A5A5A5AULL
 
-static u64 last_checksum;
-
-static ssize_t cinnamon_proc_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
-{
-    char tmp[32];
-    int len = sprintf(tmp, "0x%016llx\n", last_checksum);
-    return simple_read_from_buffer(buf, count, ppos, tmp, len);
-}
-
-static ssize_t cinnamon_proc_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
-{
-    char *kbuf;
-    size_t len = count;
-    if (len > PAGE_SIZE - 1)
-        len = PAGE_SIZE - 1;
-    kbuf = kmalloc(len + 1, GFP_KERNEL);
-    if (!kbuf)
-        return -ENOMEM;
-    if (copy_from_user(kbuf, buf, len)) {
-        kfree(kbuf);
-        return -EFAULT;
-    }
-    kbuf[len] = '\0';
-    // Remove trailing newline
-    if (len > 0 && kbuf[len-1] == '\n')
-        kbuf[--len] = '\0';
-    last_checksum = cinnamon_checksum((u8 *)kbuf, len);
-    kfree(kbuf);
-    return count;
-}
-
-static const struct file_operations cinnamon_proc_fops = {
-    .owner = THIS_MODULE,
-    .read = cinnamon_proc_read,
-    .write = cinnamon_proc_write,
-};
-
 /*
- * Check if a 32-byte block is all zeros (Fixed logic)
+ * Check if a 32-byte block is all zeros
  */
 static inline bool is_zero_block_32(const u8 *block)
 {
@@ -67,7 +27,7 @@ static inline bool is_zero_block_32(const u8 *block)
 }
 
 /*
- * Cinnamon XOR-Rotate checksum calculation (Fixed Alignment)
+ * Cinnamon XOR-Rotate checksum calculation
  */
 u64 cinnamon_checksum(const u8 *data, size_t len)
 {
@@ -107,8 +67,7 @@ bool cinnamon_verify(const u8 *data, size_t len, u64 expected_checksum)
 EXPORT_SYMBOL(cinnamon_checksum);
 EXPORT_SYMBOL(cinnamon_verify);
 
-/* * Inline checksum cho CCompress gọi 
- */
+/* Inline checksum cho CCompress gọi */
 u64 cinnamon_compress_checksum(const u8 *data, size_t len,
                              cinnamon_compress_cb compress_cb, void *cb_data)
 {
@@ -138,22 +97,17 @@ EXPORT_SYMBOL(cinnamon_compress_checksum);
 
 static int __init cinnamon_crypto_init(void)
 {
-    pr_info("Cinnamon Crypto: XOR-Rotate engine initialized\n");
-    if (!proc_create("cinnamon_checksum", 0644, NULL, &cinnamon_proc_fops)) {
-        pr_err("Failed to create /proc/cinnamon_checksum\n");
-        return -ENOMEM;
-    }
+    pr_info("CCrypto: XOR-Rotate engine initialized\n");
     return 0;
 }
 
 static void __exit cinnamon_crypto_exit(void)
 {
-    remove_proc_entry("cinnamon_checksum", NULL);
-    pr_info("Cinnamon Crypto: unloaded\n");
+    pr_info("CCrypto: unloaded\n");
 }
 
 module_init(cinnamon_crypto_init);
 module_exit(cinnamon_crypto_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Cinnamon Crypto - Ultra Fast Checksum for MSM8916");
+MODULE_DESCRIPTION("CCrypto - Ultra Fast Checksum for MSM8916");
