@@ -110,6 +110,9 @@ enum pageflags {
 	PG_compound_lock,
 #endif
 	PG_readahead,		/* page in a readahead window */
+#ifdef CONFIG_SPM
+	PG_spm,			/* SPM merged page */
+#endif
 	__NR_PAGEFLAGS,
 
 	/* Filesystems */
@@ -274,6 +277,14 @@ TESTSCFLAG(HWPoison, hwpoison)
 #else
 PAGEFLAG_FALSE(HWPoison)
 #define __PG_HWPOISON 0
+#endif
+
+#ifdef CONFIG_SPM
+PAGEFLAG(Spm, spm) __CLEARPAGEFLAG(Spm, spm)
+#define __PG_SPM (1UL << PG_spm)
+#else
+PAGEFLAG_FALSE(Spm)
+#define __PG_SPM 0
 #endif
 
 u64 stable_page_flags(struct page *page);

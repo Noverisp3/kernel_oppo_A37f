@@ -24,6 +24,10 @@
 
 struct address_space;
 
+#ifdef CONFIG_SPM
+struct spm_mm;
+#endif
+
 #define USE_SPLIT_PTLOCKS	(NR_CPUS >= CONFIG_SPLIT_PTLOCK_CPUS)
 
 /*
@@ -456,6 +460,9 @@ struct mm_struct {
 	bool tlb_flush_pending;
 #endif
 	struct uprobes_state uprobes_state;
+#ifdef CONFIG_SPM
+	struct spm_mm *spm_owner;	/* SPM per-mm data */
+#endif
 };
 
 /* first nid will either be a valid NID or one of these values */
