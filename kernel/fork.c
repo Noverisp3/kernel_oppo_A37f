@@ -52,6 +52,7 @@
 #include <linux/profile.h>
 #include <linux/rmap.h>
 #include <linux/ksm.h>
+#include <linux/spm.h>
 #include <linux/acct.h>
 #include <linux/tsacct_kern.h>
 #include <linux/cn_proc.h>
@@ -401,6 +402,11 @@ static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 	retval = ksm_fork(mm, oldmm);
 	if (retval)
 		goto out;
+#ifdef CONFIG_SPM
+	retval = spm_fork(mm, oldmm);
+	if (retval)
+		goto out;
+#endif
 	retval = khugepaged_fork(mm, oldmm);
 	if (retval)
 		goto out;
@@ -640,6 +646,9 @@ int mmput(struct mm_struct *mm)
 		uprobe_clear_state(mm);
 		exit_aio(mm);
 		ksm_exit(mm);
+#ifdef CONFIG_SPM
+		spm_exit(mm);
+#endif
 		khugepaged_exit(mm); /* must run before exit_mmap */
 		exit_mmap(mm);
 		set_mm_exe_file(mm, NULL);

@@ -19,6 +19,9 @@
 #include <linux/blkdev.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
+#ifdef CONFIG_SPM
+#include <linux/spm.h>
+#endif
 
 /*
  * Any behaviour which results in changes to the vma->vm_flags needs to
@@ -82,6 +85,16 @@ static long madvise_behavior(struct vm_area_struct * vma,
 		new_flags &= ~VM_DONTDUMP;
 		break;
 	case MADV_MERGEABLE:
+		if (vma->vm_flags & VM_MERGEABLE)
+			return 0;
+		if (!vma->anon_vma)
+			return -EINVAL;
+		/* Kích hoạt SPM cho mm này */
+#ifdef CONFIG_SPM
+		spm_enter(vma->vm_mm);
+#endif
+		vma->vm_flags |= VM_MERGEABLE;
+		break;
 	case MADV_UNMERGEABLE:
 		error = ksm_madvise(vma, start, end, behavior, &new_flags);
 		if (error)

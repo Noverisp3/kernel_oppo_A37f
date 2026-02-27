@@ -6409,6 +6409,9 @@ static const struct trace_print_flags pageflag_names[] = {
 	{1UL << PG_compound_lock,	"compound_lock"	},
 #endif
 	{1UL << PG_readahead,           "PG_readahead"  },
+#ifdef CONFIG_SPM
+	{1UL << PG_spm,			"spm"		},
+#endif
 };
 
 static void dump_page_flags(unsigned long flags)

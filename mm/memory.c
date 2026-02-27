@@ -46,6 +46,7 @@
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
 #include <linux/ksm.h>
+#include <linux/spm.h>
 #include <linux/rmap.h>
 #include <linux/export.h>
 #include <linux/delayacct.h>
@@ -2665,7 +2666,7 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	 * Take out anonymous pages first, anonymous shared vmas are
 	 * not dirty accountable.
 	 */
-	if (PageAnon(old_page) && !PageKsm(old_page)) {
+	if (PageAnon(old_page) && !PageKsm(old_page) && !PageSpm(old_page)) {
 		if (!trylock_page(old_page)) {
 			page_cache_get(old_page);
 			pte_unmap_unlock(page_table, ptl);
@@ -2689,6 +2690,19 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 			goto reuse;
 		}
 		unlock_page(old_page);
+#ifdef CONFIG_SPM
+	} else if (PageSpm(old_page)) {
+		/*
+		 * Handle SPM page write fault
+		 * Create private copy for this mm_struct
+		 */
+		new_page = spm_handle_write_fault(vma, address, page_table);
+		if (new_page) {
+			/* spm_handle_write_fault already handles refcount */
+			goto gotten;
+		}
+		/* Fallback to normal COW if SPM fails */
+#endif
 	} else if (unlikely((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
 					(VM_WRITE|VM_SHARED))) {
 		/*
