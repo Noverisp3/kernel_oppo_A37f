@@ -191,13 +191,14 @@ static void msm_wfi_cpu_die(unsigned int cpu)
 	}
 	for (;;) {
 		lpm_cpu_hotplug_enter(cpu);
-		msm_spm_set_low_power_mode(MSM_SPM_MODE_POWER_COLLAPSE, true);
+		msm_spm_set_low_power_mode(MSM_SPM_MODE_CLOCK_GATING, true);
 		if (secondary_holding_pen_release == cpu_logical_map(cpu)) {
 			/*Proper wake up */
 			break;
 		}
-		pr_debug("CPU%u: spurious wakeup call\n", cpu);
-		BUG();
+		pr_err("CPU%u: spurious wakeup call, going back to sleep\n", cpu);
+		/* Tiếp tục vòng lặp, không panic */
+		continue;
 	}
 }
 #endif

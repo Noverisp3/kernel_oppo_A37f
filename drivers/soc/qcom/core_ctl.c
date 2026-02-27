@@ -56,6 +56,7 @@ extern struct cpufreq_governor cpufreq_gov_powersave;
 extern struct cpufreq_governor cpufreq_gov_interactive;
 
 #define MAX_CPUS_PER_GROUP 4
+#define OFFLINE_TIMEOUT_MS 2000
 
 struct cpu_data {
 	/* Per CPU data. */
@@ -252,10 +253,17 @@ recovery_retry:
 	}
 
     /* Restart charger update thread */
-    chip = (struct opchg_charger *)opchg_chip;  // ép kiểu tường minh
-    if (chip) {
-        schedule_delayed_work(&chip->update_opchg_thread_work, msecs_to_jiffies(100));
-    }
+	chip = (struct opchg_charger *)opchg_chip;
+	if (chip) {
+		/* Hủy work cũ nếu đang chạy (tránh chồng chéo) */
+		cancel_delayed_work_sync(&chip->update_opchg_thread_work);
+		/* Schedule lại sau 100ms */
+		schedule_delayed_work(&chip->update_opchg_thread_work,
+		                      msecs_to_jiffies(100));
+		pr_debug("CSleep: Charger update thread rescheduled\n");
+	} else {
+		pr_err("CSleep: opchg_chip is NULL, cannot restart charger\n");
+	}
 
 	if (recovery_attempted) {
 		pr_info("CSleep: Recovery completed successfully after %d attempts\n", retry_count + 1);
@@ -291,6 +299,14 @@ screen_off_retry:
 
 	cores_disabled = 0;
 	freq_frozen = 0;
+
+	/* Reinit completions trước khi kích hoạt hotplug */
+	for_each_possible_cpu(i) {
+		if (i == 0) continue;
+		cpu_ptr = &per_cpu(cpu_state, i);
+		if (cpu_ptr->inited)
+			init_completion(&cpu_ptr->offline_done);
+	}
 
 	/* 1. Force hệ thống chỉ dùng 1 nhân (CPU0) */
 	for_each_possible_cpu(i) {
@@ -386,18 +402,23 @@ screen_off_retry:
 	for_each_possible_cpu(i) {
 		if (i == 0) continue;  // Skip CPU0 since it stays online
 		cpu_ptr = &per_cpu(cpu_state, i);  // C90: assignment only
-		if (cpu_ptr->inited) {
-			init_completion(&cpu_ptr->offline_done);  // Reinitialize completion
-		}
 	}
 	
 	/* Wait for each CPU to go offline with timeout */
+	offline_timeout = 0;
 	for_each_possible_cpu(i) {
 		if (i == 0) continue;  // Skip CPU0 since it stays online
 		cpu_ptr = &per_cpu(cpu_state, i);  // C90: assignment only
 		if (cpu_ptr->inited) {
-			if (!wait_for_completion_timeout(&cpu_ptr->offline_done, msecs_to_jiffies(500))) {
-				pr_warn("CSleep: Timeout waiting for CPU%d offline, continuing...\n", i);
+			if (!wait_for_completion_timeout(&cpu_ptr->offline_done,
+					msecs_to_jiffies(OFFLINE_TIMEOUT_MS))) {
+				/* Check if CPU is actually offline - if so, don't report anything */
+				if (!cpu_online(i)) {
+					/* CPU is offline, just continue silently */
+					continue;
+				}
+				/* Only report timeout if CPU is actually still online */
+				pr_warn("CSleep: Timeout waiting for CPU%d offline, state=online\n", i);
 				offline_timeout++;
 			} else {
 				pr_debug("CSleep: CPU%d offline completed\n", i);
@@ -408,30 +429,30 @@ screen_off_retry:
 	/* Check CPU online status after waiting */
 	cores_disabled = 0;
 	for_each_possible_cpu(i) {
-		if (i == 0) continue;  // Skip CPU0 since it stays online
-		if (!cpu_online(i)) {
+		if (i == 0) continue;
+		if (!cpu_online(i))
 			cores_disabled++;
-		}
 	}
 	
-	if (offline_timeout > 0) {
-		pr_warn("CSleep: %d CPUs timed out during offline operation\n", offline_timeout);
-	}
-	
-	mutex_lock(&core_ctl_mutex);  /* Protect against nested calls */
-	if (atomic_read(&hotplug_refcount) > 0) {
-		pr_info("CSleep: Disabling CPU hotplug (refcount=%d)\n", 
-			atomic_read(&hotplug_refcount));
-		cpu_hotplug_disable();
-		atomic_dec(&hotplug_refcount);
-		pr_info("CSleep: CPU hotplug disabled successfully (refcount=%d)\n", 
-			atomic_read(&hotplug_refcount));
+	/* Only report if CPUs are actually still online */
+	if (cores_disabled < (num_possible_cpus() - 1)) {
+		int still_online = (num_possible_cpus() - 1) - cores_disabled;
+		pr_warn("CSleep: %d CPUs still online after waiting\n", still_online);
 	} else {
-		pr_warn("CSleep: WARNING - CPU hotplug already disabled (refcount=%d), skipping\n", 
-			atomic_read(&hotplug_refcount));
-		dump_stack();  /* Debug: Show call stack for analysis */
+		pr_info("CSleep: All non-boot CPUs successfully offline\n");
 	}
-	mutex_unlock(&core_ctl_mutex);
+	
+	mutex_lock(&core_ctl_mutex);
+if (atomic_read(&hotplug_refcount) > 0) {
+	cpu_hotplug_disable();
+	atomic_dec(&hotplug_refcount);
+	pr_info("CSleep: CPU hotplug disabled (refcount=%d)\n",
+			atomic_read(&hotplug_refcount));
+} else {
+	pr_warn("CSleep: CPU hotplug already disabled (refcount=%d)\n",
+			atomic_read(&hotplug_refcount));
+}
+mutex_unlock(&core_ctl_mutex);
 }
 
 static int screen_state_cb(struct notifier_block *nb, unsigned long val, void *data)
@@ -1112,18 +1133,24 @@ static void __ref do_hotplug(struct cpu_data *f)
 			if (c->cpu == 0)
 				continue;
 
-			/* Don't offline busy CPUs. */
-			if (c->is_busy)
+			/* Don't offline busy CPUs, unless locked */
+			if (c->is_busy && !f->is_locked)
 				continue;
 
 			pr_debug("Trying to Offline CPU%u\n", c->cpu);
-			if (cpu_down(c->cpu))
-				pr_debug("Unable to Offline CPU%u\n", c->cpu);
-			else {
-				/* Signal completion when CPU successfully goes offline */
-				struct cpu_data *cpu_ptr = &per_cpu(cpu_state, c->cpu);
-				if (cpu_ptr->inited)
-					complete(&cpu_ptr->offline_done);
+			if (cpu_online(c->cpu)) {
+				if (cpu_down(c->cpu)) {
+					pr_err("core_ctl: Failed to offline CPU%u\n", c->cpu);
+					/* Không gọi completion vì CPU vẫn online */
+				} else {
+					/* Signal completion when CPU successfully goes offline */
+					struct cpu_data *cpu_ptr = &per_cpu(cpu_state, c->cpu);
+					if (cpu_ptr->inited) {
+						complete(&cpu_ptr->offline_done);
+					}
+				}
+			} else {
+				pr_debug("CPU%u already offline, skipping cpu_down\n", c->cpu);
 			}
 		}
 
@@ -1145,15 +1172,24 @@ static void __ref do_hotplug(struct cpu_data *f)
 			if (c->cpu == 0)
 				continue;
 
+			/* Don't offline busy CPUs, unless locked */
+			if (c->is_busy && !f->is_locked)
+				continue;
+
 			pr_debug("Trying to Offline CPU%u\n", c->cpu);
-			if (cpu_down(c->cpu))
-				pr_debug("Unable to Offline CPU%u\n", c->cpu);
-			else {
-				/* Signal completion when CPU successfully goes offline */
-				struct cpu_data *cpu_ptr = &per_cpu(cpu_state, c->cpu);
-				if (cpu_ptr->inited) {
-					complete(&cpu_ptr->offline_done);
+			if (cpu_online(c->cpu)) {
+				if (cpu_down(c->cpu)) {
+					pr_err("core_ctl: Failed to offline CPU%u\n", c->cpu);
+					/* Không gọi completion vì CPU vẫn online */
+				} else {
+					/* Signal completion when CPU successfully goes offline */
+					struct cpu_data *cpu_ptr = &per_cpu(cpu_state, c->cpu);
+					if (cpu_ptr->inited) {
+						complete(&cpu_ptr->offline_done);
+					}
 				}
+			} else {
+				pr_debug("CPU%u already offline, skipping cpu_down\n", c->cpu);
 			}
 		}
 	} else if (f->online_cpus < need) {
