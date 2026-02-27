@@ -199,7 +199,12 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 	u8 value, val1, val2, val3;
 
 	struct cinnamon_ctx *ctx = private;
-	u64 (*prev_blocks)[CINNAMON_BLOCK_SIZE / sizeof(u64)] = ctx->prev_blocks;
+	u64 (*prev_blocks)[CINNAMON_BLOCK_SIZE / sizeof(u64)];
+	
+	if (unlikely(!ctx))
+		return -EINVAL;
+	
+	prev_blocks = ctx->prev_blocks;
 
 	memset(ctx->prev_blocks, 0, sizeof(ctx->prev_blocks));
 	ctx->prev_index = 0;
