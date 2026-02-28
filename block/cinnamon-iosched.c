@@ -47,6 +47,8 @@ struct cinnamon_data {
 	int last_ra_pressure;
 	/* Per-queue hysteresis timing */
 	unsigned long last_pressure_change_jiffies;
+	/* Parameter change tracking to avoid conflicts */
+	unsigned long last_manual_param_change_jiffies;
 	/* Tunable parameters */
 	int write_expire_ms;
 	int read_batch;
@@ -73,6 +75,8 @@ struct cinnamon_data {
 	pid_t last_interactive_pid;
 	unsigned long interactive_expire;
 	struct request_queue *q;   /* để lấy ra_pages trong sysfs */
+	/* Dispatch sequence counter for optimization */
+	int dispatch_seq;
 };
 
 /* * Global atomic variable for CC engine
@@ -106,33 +110,59 @@ static void cinnamon_update_ra(struct cinnamon_data *cd, struct request_queue *q
 
 static void cinnamon_set_pressure(struct cinnamon_data *cd, struct request_queue *q, int new_pressure)
 {
-	int curr_pressure = atomic_read(&cinnamon_io_pressure);
+	int old_pressure, curr_pressure;
 	int changed = 0;
-	if (new_pressure != curr_pressure) {
-		if (time_after(jiffies, cd->last_pressure_change_jiffies + msecs_to_jiffies(cd->hysteresis_ms))) {
-			atomic_set(&cinnamon_io_pressure, new_pressure);
-			cd->last_pressure_change_jiffies = jiffies;
-			changed = 1;
 
-			/* Race to Idle: khi xuống 0, giảm batch để xử lý nhanh */
-			if (new_pressure == 0) {
-				/* Lưu giá trị hiện tại */
-				cd->saved_read_batch = cd->read_batch;
-				cd->saved_write_batch = cd->write_batch;
-				cd->saved_write_expire_ms = cd->write_expire_ms;
-				/* Giảm batch, tăng thời gian chờ để không vội */
-				cd->read_batch = 2;
-				cd->write_batch = 2;
-				cd->write_expire_ms = 500;
-			} else if (curr_pressure == 0) {
-				/* Thoát khỏi idle: phục hồi tham số đã lưu */
-				cd->read_batch = cd->saved_read_batch;
-				cd->write_batch = cd->saved_write_batch;
-				cd->write_expire_ms = cd->saved_write_expire_ms;
+	/* Loop to handle race conditions properly */
+	do {
+		curr_pressure = atomic_read(&cinnamon_io_pressure);
+
+		/* If same pressure, no change needed */
+		if (new_pressure == curr_pressure)
+			return;
+
+		/* Check hysteresis - only allow changes after hysteresis period */
+		if (!time_after(jiffies, cd->last_pressure_change_jiffies + msecs_to_jiffies(cd->hysteresis_ms)))
+			return;
+
+		/* Priority-based pressure resolution:
+		 * - Higher pressure values (more urgent) take precedence
+		 * - 0 (idle) can be overridden by any non-zero
+		 * - Non-zero pressures cannot be overridden by 0 (idle)
+		 */
+		if (curr_pressure == 0 || new_pressure > curr_pressure) {
+			/* Attempt to set new pressure atomically */
+			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure, curr_pressure, new_pressure);
+			if (old_pressure == curr_pressure) {
+				/* Successfully set pressure */
+				cd->last_pressure_change_jiffies = jiffies;
+				changed = 1;
+
+				/* Race to Idle: smooth parameter transitions for eMMC compatibility */
+				if (new_pressure == 0) {
+					/* Save current values */
+					cd->saved_read_batch = cd->read_batch;
+					cd->saved_write_batch = cd->write_batch;
+					cd->saved_write_expire_ms = cd->write_expire_ms;
+					/* Reduce batch moderately for eMMC (don't go too low to maintain sequential write performance) */
+					cd->read_batch = max(cd->read_batch / 2, 8);  /* eMMC minimum: 8 */
+					cd->write_batch = max(cd->write_batch / 2, 8);  /* eMMC minimum: 8 */
+					cd->write_expire_ms = min(cd->write_expire_ms + 100, 300); /* Gradual increase */
+				} else if (curr_pressure == 0) {
+					/* Restore parameters when exiting idle */
+					cd->read_batch = cd->saved_read_batch;
+					cd->write_batch = cd->saved_write_batch;
+					cd->write_expire_ms = cd->saved_write_expire_ms;
+				}
 			}
+			/* If cmpxchg failed, another thread changed pressure, loop to retry */
+		} else {
+			/* Lower priority pressure, don't override higher priority */
+			return;
 		}
-	}
-	/* If equal or hysteresis not passed, do nothing */
+	} while (!changed);
+
+	/* If pressure changed, update read-ahead */
 	if (changed)
 		cinnamon_update_ra(cd, q);
 }
@@ -144,54 +174,101 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 	if (cd->history_count < CINNAMON_HISTORY_SIZE)
 		cd->history_count++;
 
-	/* Dự đoán hướng nếu có ít nhất 2 mẫu */
-	if (cd->history_count >= 2) {
+	/* Enhanced prediction with confidence metric */
+	if (cd->history_count >= 3) {
+		int i, consistent = 0, total_diffs = 0;
+		sector_t avg_diff = 0, min_diff = 0, max_diff = 0;
 		int idx = (cd->history_index - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-		int prev_idx = (idx - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-		sector_t diff = cd->read_history[idx] - cd->read_history[prev_idx];
-
-		if (diff > 0)
-			cd->last_read_direction = 1;
-		else if (diff < 0)
-			cd->last_read_direction = -1;
-		else
-			cd->last_read_direction = 0;
-
-		/* Dự đoán sector tiếp theo nếu đủ 3 mẫu và các bước bằng nhau */
-		if (cd->history_count >= 3) {
-			int i, consistent = 1;
-			sector_t last_diff = 0;
-			for (i = 1; i < min(3, cd->history_count); i++) {
-				int cur = (cd->history_index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-				int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-				sector_t d = cd->read_history[cur] - cd->read_history[prev];
-				if (i == 1)
-					last_diff = d;
-				else if (d != last_diff) {
-					consistent = 0;
-					break;
-				}
+		int confidence;
+		
+		/* Calculate differences and statistics */
+		for (i = 1; i < min(5, cd->history_count); i++) { /* Use up to 5 samples */
+			int cur = (cd->history_index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
+			int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
+			sector_t diff = cd->read_history[cur] - cd->read_history[prev];
+			
+			if (i == 1) {
+				min_diff = max_diff = diff;
+				avg_diff = diff;
+			} else {
+				min_diff = min(min_diff, diff);
+				max_diff = max(max_diff, diff);
+				avg_diff = (avg_diff * (i-1) + diff) / i;
 			}
-			if (consistent && last_diff != 0)
-				cd->predicted_sector = cd->read_history[idx] + last_diff;
-			else
-				cd->predicted_sector = 0;
+			total_diffs++;
+			
+			/* Check consistency within reasonable bounds */
+			if (abs(diff - avg_diff) < 1024) /* Within 4KB pages */
+				consistent++;
 		}
+		
+		/* Calculate confidence (0-100) */
+		confidence = consistent * 100 / total_diffs;
+		
+		/* Only predict if confidence is high and pattern is sequential */
+		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 && 
+		    avg_diff != 0 && abs(avg_diff) < 1048576) { /* Within 4GB */
+			cd->predicted_sector = cd->read_history[idx] + avg_diff;
+			cd->last_read_direction = avg_diff > 0 ? 1 : -1;
+		} else {
+			/* Random I/O detected - disable prediction */
+			cd->predicted_sector = 0;
+			cd->last_read_direction = 0;
+		}
+	} else {
+		cd->predicted_sector = 0;
+		cd->last_read_direction = 0;
 	}
 }
 
 static bool is_interactive_process(struct cinnamon_data *cd, struct request *rq)
 {
 	pid_t pid = current->pid;
+	char comm[TASK_COMM_LEN];
+
+	/* Quick check for cached interactive process */
 	if (pid == cd->last_interactive_pid && time_before(jiffies, cd->interactive_expire))
 		return true;
 
-	/* Chỉ request rất nhỏ (≤4KB) và nice <=0 mới coi là interactive */
-	if (blk_rq_bytes(rq) <= 4 * 1024 && task_nice(current) <= 0) {
+	/* Get process name for classification */
+	get_task_comm(comm, current);
+
+	/* Check for known interactive system processes */
+	if (strcmp(comm, "system_server") == 0 ||
+	    strcmp(comm, "surfaceflinger") == 0 ||
+	    strcmp(comm, "android.ui") == 0 ||
+	    strcmp(comm, "InputDispatcher") == 0 ||
+	    strcmp(comm, "systemui") == 0 ||
+	    strncmp(comm, "com.android.", 12) == 0 ||
+	    strcmp(comm, "zygote") == 0 ||
+	    strcmp(comm, "servicemanager") == 0) {
 		cd->last_interactive_pid = pid;
 		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
 		return true;
 	}
+
+	/* Check for real-time priority processes */
+	if (current->rt_priority > 0) {
+		cd->last_interactive_pid = pid;
+		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
+		return true;
+	}
+
+	/* Enhanced heuristic: small requests from non-nice processes */
+	if (blk_rq_bytes(rq) <= 16 * 1024 && task_nice(current) <= 5) {
+		/* Allow larger requests (16KB) for potentially interactive processes */
+		cd->last_interactive_pid = pid;
+		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
+		return true;
+	}
+
+	/* Check for frequent small I/O pattern (interactive behavior) */
+	if (cd->last_interactive_pid == pid && blk_rq_bytes(rq) <= 64 * 1024) {
+		/* Recent interactive process doing I/O - likely still interactive */
+		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
+		return true;
+	}
+
 	return false;
 }
 
@@ -217,33 +294,40 @@ static int cinnamon_merge(struct request_queue *q, struct request **req, struct 
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 	int dir = bio_data_dir(bio);
-	sector_t sector = bio->bi_sector;          /* vị trí bắt đầu của bio (phiên bản cũ) */
-	sector_t last_sector = sector + bio_sectors(bio); /* vị trí kết thúc */
-	struct request *last_rq;
+	sector_t sector = bio->bi_sector;
+	sector_t last_sector = sector + bio_sectors(bio);
+	struct list_head *queue_head;
+	struct request *rq_iter;
 
-	if (dir == READ && !list_empty(&cd->read_queue)) {
-		last_rq = list_entry(cd->read_queue.prev, struct request, queuelist);
-		/* Back merge: bio bắt đầu ngay sau request cuối */
-		if (sector == blk_rq_pos(last_rq) + blk_rq_sectors(last_rq)) {
-			*req = last_rq;
+	/* Choose appropriate queue based on bio direction */
+	if (dir == READ) {
+		if (list_empty(&cd->read_queue))
+			return ELEVATOR_NO_MERGE;
+		queue_head = &cd->read_queue;
+	} else {
+		if (list_empty(&cd->write_queue))
+			return ELEVATOR_NO_MERGE;
+		queue_head = &cd->write_queue;
+	}
+
+	/* Scan entire queue for best merge opportunity */
+	list_for_each_entry(rq_iter, queue_head, queuelist) {
+		sector_t rq_sector = blk_rq_pos(rq_iter);
+		sector_t rq_last_sector = rq_sector + blk_rq_sectors(rq_iter);
+
+		/* Check for back merge: bio starts exactly after request ends */
+		if (sector == rq_last_sector) {
+			*req = rq_iter;
 			return ELEVATOR_BACK_MERGE;
 		}
-		/* Front merge: bio kết thúc tại vị trí bắt đầu của request cuối */
-		if (last_sector == blk_rq_pos(last_rq)) {
-			*req = last_rq;
-			return ELEVATOR_FRONT_MERGE;
-		}
-	} else if (dir == WRITE && !list_empty(&cd->write_queue)) {
-		last_rq = list_entry(cd->write_queue.prev, struct request, queuelist);
-		if (sector == blk_rq_pos(last_rq) + blk_rq_sectors(last_rq)) {
-			*req = last_rq;
-			return ELEVATOR_BACK_MERGE;
-		}
-		if (last_sector == blk_rq_pos(last_rq)) {
-			*req = last_rq;
+
+		/* Check for front merge: bio ends exactly at request start */
+		if (last_sector == rq_sector) {
+			*req = rq_iter;
 			return ELEVATOR_FRONT_MERGE;
 		}
 	}
+
 	return ELEVATOR_NO_MERGE;
 }
 
@@ -254,6 +338,10 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd, struct request_queu
 	int num, avg_latency_ms;
 	int queue_depth = cd->read_cnt + cd->write_cnt;
 	int read_ratio = queue_depth ? (cd->read_cnt * 100) / queue_depth : 50;
+
+	/* Skip adjustment if manual parameter changes happened recently (< 5 seconds) */
+	if (time_before(now, cd->last_manual_param_change_jiffies + msecs_to_jiffies(5000)))
+		return;
 
 	/* Chỉ điều chỉnh sau mỗi khoảng thời gian */
 	if (time_before(now, cd->last_adjust_jiffies + msecs_to_jiffies(cd->adjust_interval_ms)))
@@ -272,29 +360,29 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd, struct request_queu
 	/* Điều chỉnh dựa trên latency so với mục tiêu */
 	if (avg_latency_ms > cd->target_latency_ms * 2) {
 		/* Latency quá cao: giảm batch, giảm thời gian chờ ghi */
-		cd->read_batch = max(cd->read_batch / 2, 4);
-		cd->write_batch = max(cd->write_batch / 2, 4);
+		cd->read_batch = max(cd->read_batch / 2, 6);  /* eMMC: keep reasonable minimum */
+		cd->write_batch = max(cd->write_batch / 2, 6);  /* eMMC: keep reasonable minimum */
 		cd->write_expire_ms = max(cd->write_expire_ms / 2, 10);
 		cd->pressure_thres = max(cd->pressure_thres / 2, 8);
 	} else if (avg_latency_ms < cd->target_latency_ms / 2) {
-		/* Latency rất thấp: có thể tăng batch để tiết kiệm CPU */
-		cd->read_batch = min(cd->read_batch * 2, 64);
-		cd->write_batch = min(cd->write_batch * 2, 64);
+		/* Latency rất thấp: tăng batch vừa phải cho eMMC (don't go too high to avoid small request delays) */
+		cd->read_batch = min(cd->read_batch * 2, 32);  /* eMMC maximum: 32 */
+		cd->write_batch = min(cd->write_batch * 2, 32);  /* eMMC maximum: 32 */
 		cd->write_expire_ms = min(cd->write_expire_ms * 2, 500);
 		cd->pressure_thres = min(cd->pressure_thres * 2, 48);
 	}
 
 	/* Điều chỉnh thêm dựa trên tỉ lệ đọc/ghi: nếu đọc nhiều hơn, tăng read_batch */
 	if (read_ratio > 70) {
-		cd->read_batch = min(cd->read_batch * 2, 64);
+		cd->read_batch = min(cd->read_batch * 2, 32);  /* eMMC: cap at 32 */
 	} else if (read_ratio < 30) {
-		cd->write_batch = min(cd->write_batch * 2, 64);
+		cd->write_batch = min(cd->write_batch * 2, 32);  /* eMMC: cap at 32 */
 	}
 
 	/* Điều chỉnh dựa trên độ sâu hàng đợi: nếu hàng đợi dài, giảm batch để tránh tụt hậu */
 	if (queue_depth > cd->pressure_thres * 2) {
-		cd->read_batch = max(cd->read_batch / 2, 4);
-		cd->write_batch = max(cd->write_batch / 2, 4);
+		cd->read_batch = max(cd->read_batch / 2, 6);  /* eMMC: keep minimum 6 */
+		cd->write_batch = max(cd->write_batch / 2, 6);  /* eMMC: keep minimum 6 */
 	}
 
 	/* Lưu lại giá trị hiện tại để phục hồi khi idle */
@@ -312,77 +400,94 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	int pressure = atomic_read(&cinnamon_io_pressure);
 	unsigned long write_expire = msecs_to_jiffies(cd->write_expire_ms);
 	unsigned long read_batch = cd->read_batch;
+	int dispatch_count = 0;
 
-	/* Adjust write expire based on pressure */
-	if (pressure == 3)
+	/* Optimize: Cache expensive calculations based on pressure */
+	if (unlikely(pressure == 3)) {
 		write_expire = msecs_to_jiffies(50); /* Tighten for congestion */
-	else if (pressure <= 1)
-		write_expire = msecs_to_jiffies(250); /* Relax for read priority */
-
-	/* Adjust read batch for high pressure sequential reads */
-	if (pressure == 3)
 		read_batch = 32; /* Larger batch for boot/loading throughput */
+	} else if (pressure <= 1) {
+		write_expire = msecs_to_jiffies(250); /* Relax for read priority */
+	}
 
-	/* 1. Kiểm tra Starvation (Chống treo máy khi ghi nặng) */
+	/* Fast path: Check write starvation first (most critical) */
 	if (!list_empty(&cd->write_queue)) {
 		struct request *wrq = list_first_entry(&cd->write_queue, struct request, queuelist);
 		unsigned long fifo_time = (unsigned long)(uintptr_t)wrq->elv.priv[0];
 
-		/* Nếu lệnh ghi đã đợi quá lâu, ưu tiên nó ngay lập tức! */
 		if (time_after(now, fifo_time + write_expire)) {
 			rq = wrq;
 			target_pressure = 3; /* CONGESTED */
+			dispatch_count = 1;
 			goto dispatch_write;
 		}
 	}
 
-	/* 2. Ưu tiên Đọc (Normal operation) */
+	/* Normal priority dispatch */
 	if (!list_empty(&cd->read_queue)) {
 		if (cd->read_batch_count >= read_batch && !list_empty(&cd->write_queue)) {
 			rq = list_first_entry(&cd->write_queue, struct request, queuelist);
 			target_pressure = 2; /* WRITE BATCH */
 			cd->read_batch_count = 0;
+			dispatch_count = 1;
 			goto dispatch_write;
 		} else {
 			rq = list_first_entry(&cd->read_queue, struct request, queuelist);
 			target_pressure = 1; /* READ URGENT */
 			cd->read_batch_count++;
+			dispatch_count = 1;
 			goto dispatch_read;
 		}
 	}
 
-	/* 3. Xử lý Ghi theo lô (Batching) */
+	/* Write batching */
 	if (!list_empty(&cd->write_queue)) {
 		if (!list_empty(&cd->read_queue)) {
-			/* Read steals priority from write batch */
 			rq = list_first_entry(&cd->read_queue, struct request, queuelist);
 			target_pressure = 1; /* READ URGENT */
 			cd->read_batch_count++;
+			dispatch_count = 1;
 			goto dispatch_read;
 		} else {
 			rq = list_first_entry(&cd->write_queue, struct request, queuelist);
 			
-			/* Logic Batching đơn giản */
 			if (cd->batch_count < cd->write_batch) {
 				cd->batch_count++;
 				target_pressure = 2; /* WRITE BATCH */
 			} else {
-				/* Hết batch, nhường một nhịp (nhưng ở đây ko có read nên cứ chạy) */
 				cd->batch_count = 0;
 				target_pressure = 2;
 			}
+			dispatch_count = 1;
 			goto dispatch_write;
 		}
 	}
 
-	/* Không còn lệnh nào */
-	cinnamon_set_pressure(cd, q, 0);
-	/* Điều chỉnh tham số nếu đã đến lúc */
-	cinnamon_adjust_params(cd, q);
-	/* Prefetch dựa trên dự đoán: nếu có dự đoán và không còn request đọc, tăng read-ahead */
-	if (cd->predicted_sector != 0 && cd->read_cnt == 0 && list_empty(&cd->read_queue)) {
-		/* Tạm thời đặt read-ahead cao để kernel tự động prefetch */
-		q->backing_dev_info.ra_pages = 4096;
+	/* No requests to dispatch - optimize expensive operations */
+	{
+		/* Optimize: Only call expensive functions every N dispatches or when needed */
+		static int call_counter = 0;
+		call_counter++;
+
+		cinnamon_set_pressure(cd, q, 0);
+
+		/* Only adjust params every 100 empty dispatches (~2-5 seconds at high IOPS) */
+		if ((call_counter % 100) == 0)
+			cinnamon_adjust_params(cd, q);
+		
+		/* Only update read-ahead every 50 empty dispatches */
+		if ((call_counter % 50) == 0) {
+			if (cd->predicted_sector != 0 && cd->read_cnt == 0 && list_empty(&cd->read_queue)) {
+				unsigned long current_ra = q->backing_dev_info.ra_pages;
+				unsigned long max_ra = min(current_ra * 2, 256UL);
+				unsigned long new_ra = clamp(current_ra + 16, 16UL, max_ra);
+				
+				if (cd->last_read_direction != 0 && abs(cd->last_read_direction) == 1)
+					q->backing_dev_info.ra_pages = new_ra;
+			} else if (q->backing_dev_info.ra_pages > 64) {
+				q->backing_dev_info.ra_pages = 64;
+			}
+		}
 	}
 	return 0;
 
@@ -391,29 +496,41 @@ dispatch_read:
 		if (cd->read_cnt > 0)
 			cd->read_cnt--;
 		list_del_init(&rq->queuelist);
-		{
-			unsigned long start_time = (unsigned long)(uintptr_t)rq->elv.priv[0];
-			unsigned long latency = jiffies - start_time;
-			atomic64_add(latency, &cd->total_latency);
-			atomic_inc(&cd->num_requests);
-			if (atomic_read(&cd->num_requests) >= 1000) {
-				u64 total = atomic64_read(&cd->total_latency);
-				int num = atomic_read(&cd->num_requests);
-				atomic64_set(&cd->total_latency, total / 2);
-				atomic_set(&cd->num_requests, num / 2);
-			}
-		}
-		/* Cập nhật lịch sử đọc để dự đoán pattern */
-		cinnamon_update_read_history(cd, blk_rq_pos(rq));
 
-		/* Xóa timestamp để tránh sử dụng lại dữ liệu cũ */
+		/* Optimize: Simplified latency tracking - only update every 8 dispatches */
+		if ((dispatch_count % 8) == 0) {
+			u64 current_latency = jiffies - (unsigned long)(uintptr_t)rq->elv.priv[0];
+			u64 old_avg = atomic64_read(&cd->total_latency);
+			int old_count = atomic_read(&cd->num_requests);
+			
+			if (old_count > 0) {
+				atomic64_set(&cd->total_latency, (old_avg * 7 + current_latency * 3) / 10);
+			} else {
+				atomic64_set(&cd->total_latency, current_latency);
+			}
+			
+			if (old_count < 100)
+				atomic_set(&cd->num_requests, old_count + 1);
+			else
+				atomic_set(&cd->num_requests, old_count / 2);
+		}
+
+		/* Optimize: Only update read history every 4 read dispatches */
+		if ((cd->dispatch_seq++ % 4) == 0)
+			cinnamon_update_read_history(cd, blk_rq_pos(rq));
+
 		rq->elv.priv[0] = NULL;
 		cd->batch_count = 0;
-		/* Ưu tiên tiến trình tương tác */
+
+		/* Optimize: Cache interactive check result */
 		if (is_interactive_process(cd, rq)) {
-			target_pressure = 1; /* READ URGENT, bất kể batch */
+			target_pressure = 1; /* READ URGENT */
 		}
-		cinnamon_set_pressure(cd, q, target_pressure);
+
+		/* Optimize: Only call set_pressure when pressure actually changes */
+		if (target_pressure != atomic_read(&cinnamon_io_pressure))
+			cinnamon_set_pressure(cd, q, target_pressure);
+
 		elv_dispatch_sort(q, rq);
 		return 1;
 	}
@@ -423,29 +540,37 @@ dispatch_write:
 	if (rq) {
 		if (cd->write_cnt > 0)
 			cd->write_cnt--;
-		{
-			unsigned long start_time = (unsigned long)(uintptr_t)rq->elv.priv[0];
-			unsigned long latency = jiffies - start_time;
-			atomic64_add(latency, &cd->total_latency);
-			atomic_inc(&cd->num_requests);
-			if (atomic_read(&cd->num_requests) >= 1000) {
-				u64 total = atomic64_read(&cd->total_latency);
-				int num = atomic_read(&cd->num_requests);
-				atomic64_set(&cd->total_latency, total / 2);
-				atomic_set(&cd->num_requests, num / 2);
-			}
-		}
-		/* Xóa timestamp (không cần free vì không alloc) */
-		rq->elv.priv[0] = NULL; 
 		list_del_init(&rq->queuelist);
-		
-		cd->read_batch_count = 0;
-		/* Cập nhật áp lực dựa trên độ dài hàng đợi */
-		if ((cd->write_cnt + cd->read_cnt) > cd->pressure_thres) {
-			target_pressure = 3; /* Force ZRAM to use RAW mode */
-		}
+
+		/* Optimize: Simplified latency tracking for writes */
+		if ((dispatch_count % 16) == 0) { /* Less frequent for writes */
+			u64 current_latency = jiffies - (unsigned long)(uintptr_t)rq->elv.priv[0];
+			u64 old_avg = atomic64_read(&cd->total_latency);
+			int old_count = atomic_read(&cd->num_requests);
 			
-		cinnamon_set_pressure(cd, q, target_pressure);
+			if (old_count > 0) {
+				atomic64_set(&cd->total_latency, (old_avg * 7 + current_latency * 3) / 10);
+			} else {
+				atomic64_set(&cd->total_latency, current_latency);
+			}
+			
+			if (old_count < 100)
+				atomic_set(&cd->num_requests, old_count + 1);
+			else
+				atomic_set(&cd->num_requests, old_count / 2);
+		}
+
+		rq->elv.priv[0] = NULL;
+		cd->read_batch_count = 0;
+
+		/* Optimize: Inline queue depth check instead of always calling set_pressure */
+		if ((cd->write_cnt + cd->read_cnt) > cd->pressure_thres) {
+			if (atomic_read(&cinnamon_io_pressure) != 3)
+				cinnamon_set_pressure(cd, q, 3);
+		} else if (target_pressure != atomic_read(&cinnamon_io_pressure)) {
+			cinnamon_set_pressure(cd, q, target_pressure);
+		}
+
 		elv_dispatch_sort(q, rq);
 		return 1;
 	}
@@ -535,7 +660,9 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 	cd->saved_write_expire_ms = cd->write_expire_ms;
 	cd->last_interactive_pid = 0;
 	cd->interactive_expire = 0;
+	cd->last_manual_param_change_jiffies = jiffies; /* Initialize to avoid conflicts */
 	cd->q = q;
+	cd->dispatch_seq = 0; /* Initialize dispatch sequence counter */
 	
 	eq->elevator_data = cd;
 
