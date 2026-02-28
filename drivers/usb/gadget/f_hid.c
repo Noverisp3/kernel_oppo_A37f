@@ -54,6 +54,7 @@ struct f_hidg {
 
 	int				minor;
 	struct cdev			cdev;
+	struct device			*dev;  /* Added for device management */
 	struct usb_function		func;
 
 	struct usb_ep			*in_ep;
@@ -560,42 +561,59 @@ const struct file_operations f_hidg_fops = {
 	.llseek		= noop_llseek,
 };
 
-static int __init hidg_bind(struct usb_configuration *c, struct usb_function *f)
+static int hidg_bind(struct usb_configuration *c, struct usb_function *f)
 {
 	struct usb_ep		*ep;
 	struct f_hidg		*hidg = func_to_hidg(f);
 	int			status;
 	dev_t			dev;
 
+	pr_debug("hidg_bind: Starting HID function bind\n");
+
 	/* allocate instance-specific interface IDs, and patch descriptors */
 	status = usb_interface_id(c, f);
-	if (status < 0)
+	if (status < 0) {
+		pr_err("hidg_bind: Failed to get interface ID: %d\n", status);
 		goto fail;
+	}
 	hidg_interface_desc.bInterfaceNumber = status;
+	pr_debug("hidg_bind: Got interface ID %d\n", status);
 
 	/* allocate instance-specific endpoints */
 	status = -ENODEV;
 	ep = usb_ep_autoconfig(c->cdev->gadget, &hidg_fs_in_ep_desc);
-	if (!ep)
+	if (!ep) {
+		pr_err("hidg_bind: Failed to autoconfig IN endpoint\n");
 		goto fail;
+	}
 	ep->driver_data = c->cdev;	/* claim */
 	hidg->in_ep = ep;
+	pr_debug("hidg_bind: Configured IN endpoint\n");
 
 	ep = usb_ep_autoconfig(c->cdev->gadget, &hidg_fs_out_ep_desc);
-	if (!ep)
+	if (!ep) {
+		pr_err("hidg_bind: Failed to autoconfig OUT endpoint\n");
 		goto fail;
+	}
 	ep->driver_data = c->cdev;	/* claim */
 	hidg->out_ep = ep;
+	pr_debug("hidg_bind: Configured OUT endpoint\n");
 
 	/* preallocate request and buffer */
 	status = -ENOMEM;
 	hidg->req = usb_ep_alloc_request(hidg->in_ep, GFP_KERNEL);
-	if (!hidg->req)
+	if (!hidg->req) {
+		pr_err("hidg_bind: Failed to allocate IN request\n");
 		goto fail;
+	}
 
 	hidg->req->buf = kmalloc(hidg->report_length, GFP_KERNEL);
-	if (!hidg->req->buf)
+	if (!hidg->req->buf) {
+		pr_err("hidg_bind: Failed to allocate request buffer of size %d\n", 
+			hidg->report_length);
 		goto fail;
+	}
+	pr_debug("hidg_bind: Allocated request buffer of size %d\n", hidg->report_length);
 
 	/* set descriptor dynamic values */
 	hidg_interface_desc.bInterfaceSubClass = hidg->bInterfaceSubClass;
@@ -615,8 +633,11 @@ static int __init hidg_bind(struct usb_configuration *c, struct usb_function *f)
 
 	status = usb_assign_descriptors(f, hidg_fs_descriptors,
 			hidg_hs_descriptors, NULL);
-	if (status)
+	if (status) {
+		pr_err("hidg_bind: Failed to assign descriptors: %d\n", status);
 		goto fail;
+	}
+	pr_debug("hidg_bind: Assigned USB descriptors\n");
 
 	mutex_init(&hidg->lock);
 	spin_lock_init(&hidg->spinlock);
@@ -628,19 +649,38 @@ static int __init hidg_bind(struct usb_configuration *c, struct usb_function *f)
 	cdev_init(&hidg->cdev, &f_hidg_fops);
 	dev = MKDEV(major, hidg->minor);
 	status = cdev_add(&hidg->cdev, dev, 1);
-	if (status)
+	if (status) {
+		pr_err("hidg_bind: Failed to add char device: %d\n", status);
 		goto fail;
+	}
 
-	device_create(hidg_class, NULL, dev, NULL, "%s%d", "hidg", hidg->minor);
+	if (!hidg_class) {
+		pr_err("hidg_bind: hidg_class is NULL\n");
+		status = -ENODEV;
+		goto fail;
+	}
 
+	hidg->dev = device_create(hidg_class, NULL, dev, NULL, "%s%d", "hidg", hidg->minor);
+	if (IS_ERR(hidg->dev)) {
+		status = PTR_ERR(hidg->dev);
+		pr_err("hidg_bind: Failed to create device: %d\n", status);
+		goto fail;
+	}
+
+	pr_info("hidg_bind: HID function successfully bound\n");
 	return 0;
 
 fail:
 	ERROR(f->config->cdev, "hidg_bind FAILED\n");
 	if (hidg->req != NULL) {
-		kfree(hidg->req->buf);
-		if (hidg->in_ep != NULL)
+		if (hidg->req->buf != NULL) {
+			kfree(hidg->req->buf);
+			hidg->req->buf = NULL;
+		}
+		if (hidg->in_ep != NULL) {
 			usb_ep_free_request(hidg->in_ep, hidg->req);
+			hidg->req = NULL;
+		}
 	}
 
 	usb_free_all_descriptors(f);
@@ -651,7 +691,8 @@ static void hidg_unbind(struct usb_configuration *c, struct usb_function *f)
 {
 	struct f_hidg *hidg = func_to_hidg(f);
 
-	device_destroy(hidg_class, MKDEV(major, hidg->minor));
+	if (hidg->dev)
+		device_destroy(hidg_class, MKDEV(major, hidg->minor));
 	cdev_del(&hidg->cdev);
 
 	/* disable/free request and end point */
@@ -669,64 +710,173 @@ static void hidg_unbind(struct usb_configuration *c, struct usb_function *f)
 /*-------------------------------------------------------------------------*/
 /*                                 Strings                                 */
 
-#define CT_FUNC_HID_IDX	0
+#define HID_FUNC_HID_IDX	0
 
-static struct usb_string ct_func_string_defs[] = {
-	[CT_FUNC_HID_IDX].s	= "HID Interface",
+static struct usb_string hid_func_string_defs[] = {
+	[HID_FUNC_HID_IDX].s	= "HID Interface",
 	{},			/* end of list */
 };
 
-static struct usb_gadget_strings ct_func_string_table = {
+static struct usb_gadget_strings hid_func_string_table = {
 	.language	= 0x0409,	/* en-US */
-	.strings	= ct_func_string_defs,
+	.strings	= hid_func_string_defs,
 };
 
-static struct usb_gadget_strings *ct_func_strings[] = {
-	&ct_func_string_table,
+static struct usb_gadget_strings *hid_func_strings[] = {
+	&hid_func_string_table,
 	NULL,
 };
 
 /*-------------------------------------------------------------------------*/
 /*                             usb_configuration                           */
 
-int __init hidg_bind_config(struct usb_configuration *c,
+int hidg_bind_config(struct usb_configuration *c,
 			    struct hidg_func_descriptor *fdesc, int index)
 {
 	struct f_hidg *hidg;
 	int status;
 
-	if (index >= minors)
+	/* Default pen report descriptor for NULL fdesc case */
+	static const u8 default_report_desc[] = {
+		0x05, 0x0D,        /* Usage Page (Digitizer) */
+		0x09, 0x01,        /* Usage (Digitizer) */
+		0xA1, 0x01,        /* Collection (Application) */
+		0x09, 0x20,        /* Usage (Stylus) */
+		0xA1, 0x00,        /* Collection (Physical) */
+		0x09, 0x32,        /* Usage (In Range) */
+		0x15, 0x00,        /* Logical Minimum (0) */
+		0x25, 0x01,        /* Logical Maximum (1) */
+		0x95, 0x01,        /* Report Count (1) */
+		0x75, 0x01,        /* Report Size (1) */
+		0x81, 0x02,        /* Input (Data, Variable, Absolute) */
+		0x09, 0x42,        /* Usage (Tip Switch) */
+		0x15, 0x00,        /* Logical Minimum (0) */
+		0x25, 0x01,        /* Logical Maximum (1) */
+		0x95, 0x01,        /* Report Count (1) */
+		0x75, 0x01,        /* Report Size (1) */
+		0x81, 0x02,        /* Input (Data, Variable, Absolute) */
+		0x09, 0x44,        /* Usage (Barrel Switch) */
+		0x15, 0x00,        /* Logical Minimum (0) */
+		0x25, 0x01,        /* Logical Maximum (1) */
+		0x95, 0x01,        /* Report Count (1) */
+		0x75, 0x01,        /* Report Size (1) */
+		0x81, 0x02,        /* Input (Data, Variable, Absolute) */
+		0x95, 0x05,        /* Report Count (5) */
+		0x75, 0x01,        /* Report Size (1) */
+		0x81, 0x03,        /* Input (Constant, Variable, Absolute) */
+		0x05, 0x01,        /* Usage Page (Generic Desktop) */
+		0x09, 0x30,        /* Usage (X) */
+		0x15, 0x00,        /* Logical Minimum (0) */
+		0x26, 0xFF, 0x7F,  /* Logical Maximum (32767) */
+		0x35, 0x00,        /* Physical Minimum (0) */
+		0x46, 0xFF, 0x7F,  /* Physical Maximum (32767) */
+		0x65, 0x00,        /* Unit (None) */
+		0x55, 0x00,        /* Unit Exponent (0) */
+		0x75, 0x10,        /* Report Size (16) */
+		0x95, 0x01,        /* Report Count (1) */
+		0x81, 0x02,        /* Input (Data, Variable, Absolute) */
+		0x09, 0x31,        /* Usage (Y) */
+		0x15, 0x00,        /* Logical Minimum (0) */
+		0x26, 0xFF, 0x7F,  /* Logical Maximum (32767) */
+		0x35, 0x00,        /* Physical Minimum (0) */
+		0x46, 0xFF, 0x7F,  /* Physical Maximum (32767) */
+		0x65, 0x00,        /* Unit (None) */
+		0x55, 0x00,        /* Unit Exponent (0) */
+		0x75, 0x10,        /* Report Size (16) */
+		0x95, 0x01,        /* Report Count (1) */
+		0x81, 0x02,        /* Input (Data, Variable, Absolute) */
+		0x05, 0x0D,        /* Usage Page (Digitizer) */
+		0x09, 0x30,        /* Usage (Tip Pressure) */
+		0x15, 0x00,        /* Logical Minimum (0) */
+		0x26, 0xFF, 0x03,  /* Logical Maximum (1023) */
+		0x35, 0x00,        /* Physical Minimum (0) */
+		0x46, 0xFF, 0x03,  /* Physical Maximum (1023) */
+		0x75, 0x0A,        /* Report Size (10) */
+		0x95, 0x01,        /* Report Count (1) */
+		0x81, 0x02,        /* Input (Data, Variable, Absolute) */
+		/* Padding 6 bits để đủ 8 byte */
+		0x75, 0x06,        /* Report Size (6) */
+		0x95, 0x01,        /* Report Count (1) */
+		0x81, 0x03,        /* Input (Constant, Variable, Absolute) */
+		/* Padding 8 bits (giữ nguyên) */
+		0x75, 0x08,        /* Report Size (8) */
+		0x95, 0x01,        /* Report Count (1) */
+		0x81, 0x03,        /* Input (Constant, Variable, Absolute) */
+		0xC0,              /* End Collection */
+		0xC0               /* End Collection */
+	};
+
+	pr_debug("hidg_bind_config: Starting HID config bind, index=%d\n", index);
+
+	if (index >= minors) {
+		pr_err("hidg_bind_config: Index %d >= minors %d\n", index, minors);
 		return -ENOENT;
+	}
 
 	/* maybe allocate device-global string IDs, and patch descriptors */
-	if (ct_func_string_defs[CT_FUNC_HID_IDX].id == 0) {
+	if (hid_func_string_defs[HID_FUNC_HID_IDX].id == 0) {
 		status = usb_string_id(c->cdev);
-		if (status < 0)
+		if (status < 0) {
+			pr_err("hidg_bind_config: Failed to get string ID: %d\n", status);
 			return status;
-		ct_func_string_defs[CT_FUNC_HID_IDX].id = status;
+		}
+		hid_func_string_defs[HID_FUNC_HID_IDX].id = status;
 		hidg_interface_desc.iInterface = status;
+		pr_debug("hidg_bind_config: Got string ID %d\n", status);
 	}
 
 	/* allocate and initialize one new instance */
 	hidg = kzalloc(sizeof *hidg, GFP_KERNEL);
-	if (!hidg)
-		return -ENOMEM;
-
-	hidg->minor = index;
-	hidg->bInterfaceSubClass = fdesc->subclass;
-	hidg->bInterfaceProtocol = fdesc->protocol;
-	hidg->report_length = fdesc->report_length;
-	hidg->report_desc_length = fdesc->report_desc_length;
-	hidg->report_desc = kmemdup(fdesc->report_desc,
-				    fdesc->report_desc_length,
-				    GFP_KERNEL);
-	if (!hidg->report_desc) {
-		kfree(hidg);
+	if (!hidg) {
+		pr_err("hidg_bind_config: Failed to allocate hidg structure\n");
 		return -ENOMEM;
 	}
+	pr_debug("hidg_bind_config: Allocated hidg structure\n");
+
+	hidg->minor = index;
+
+	/* Handle NULL fdesc by providing default values */
+	if (fdesc) {
+		pr_debug("hidg_bind_config: Using provided descriptor\n");
+		hidg->bInterfaceSubClass = fdesc->subclass;
+		hidg->bInterfaceProtocol = fdesc->protocol;
+		hidg->report_length = fdesc->report_length;
+		hidg->report_desc_length = fdesc->report_desc_length;
+		
+		if (fdesc->report_desc_length > 0 && fdesc->report_desc) {
+			hidg->report_desc = kmemdup(fdesc->report_desc,
+						    fdesc->report_desc_length,
+						    GFP_KERNEL);
+			if (!hidg->report_desc) {
+				pr_err("hidg_bind_config: Failed to duplicate report descriptor\n");
+				kfree(hidg);
+				return -ENOMEM;
+			}
+		} else {
+			pr_err("hidg_bind_config: Invalid report descriptor in fdesc\n");
+			kfree(hidg);
+			return -EINVAL;
+		}
+	} else {
+		pr_debug("hidg_bind_config: Using default pen descriptor\n");
+		/* Default HID descriptor for pen/stylus device */
+		hidg->bInterfaceSubClass = 0;
+		hidg->bInterfaceProtocol = 0;
+		hidg->report_length = 8;   /* Must match descriptor structure */
+		hidg->report_desc_length = sizeof(default_report_desc);
+		hidg->report_desc = kmemdup(default_report_desc, sizeof(default_report_desc), GFP_KERNEL);
+		if (!hidg->report_desc) {
+			pr_err("hidg_bind_config: Failed to duplicate default descriptor\n");
+			kfree(hidg);
+			return -ENOMEM;
+		}
+	}
+
+	pr_debug("hidg_bind_config: Report length=%d, desc_length=%d\n", 
+		hidg->report_length, hidg->report_desc_length);
 
 	hidg->func.name    = "hid";
-	hidg->func.strings = ct_func_strings;
+	hidg->func.strings = hid_func_strings;
 	hidg->func.bind    = hidg_bind;
 	hidg->func.unbind  = hidg_unbind;
 	hidg->func.set_alt = hidg_set_alt;
@@ -737,26 +887,52 @@ int __init hidg_bind_config(struct usb_configuration *c,
 	hidg->qlen	   = 4;
 
 	status = usb_add_function(c, &hidg->func);
-	if (status)
+	if (status) {
+		pr_err("hidg_bind_config: Failed to add function: %d\n", status);
+		kfree(hidg->report_desc);
 		kfree(hidg);
+		return status;
+	}
 
+	pr_info("hidg_bind_config: HID function successfully added\n");
 	return status;
 }
 
-int __init ghid_setup(struct usb_gadget *g, int count)
+int ghid_setup(struct usb_gadget *g, int count)
 {
 	int status;
 	dev_t dev;
 
-	hidg_class = class_create(THIS_MODULE, "hidg");
+	pr_debug("ghid_setup: Starting HID gadget setup, count=%d\n", count);
 
-	status = alloc_chrdev_region(&dev, 0, count, "hidg");
-	if (!status) {
-		major = MAJOR(dev);
-		minors = count;
+	if (hidg_class) {
+		pr_warn("ghid_setup: hidg_class already exists, skipping setup\n");
+		return 0;
 	}
 
-	return status;
+	hidg_class = class_create(THIS_MODULE, "hidg");
+	if (IS_ERR(hidg_class)) {
+		status = PTR_ERR(hidg_class);
+		pr_err("ghid_setup: Failed to create hidg class: %d\n", status);
+		hidg_class = NULL;
+		return status;
+	}
+	pr_debug("ghid_setup: Created hidg class\n");
+
+	status = alloc_chrdev_region(&dev, 0, count, "hidg");
+	if (status) {
+		pr_err("ghid_setup: Failed to allocate chrdev region: %d\n", status);
+		class_destroy(hidg_class);
+		hidg_class = NULL;
+		return status;
+	}
+
+	major = MAJOR(dev);
+	minors = count;
+	pr_info("ghid_setup: Successfully setup HID gadget, major=%d, minors=%d\n", 
+		major, minors);
+
+	return 0;
 }
 
 void ghid_cleanup(void)

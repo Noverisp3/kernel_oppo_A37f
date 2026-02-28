@@ -79,6 +79,7 @@
 #endif
 #include "f_ncm.c"
 #include "f_charger.c"
+#include "f_hid.c"
 
 MODULE_AUTHOR("Mike Lockwood");
 MODULE_DESCRIPTION("Android Composite USB Driver");
@@ -488,6 +489,7 @@ static int android_enable(struct android_dev *dev)
 		return err;
 
 	if (--dev->disable_depth == 0) {
+		struct android_configuration *rollback_conf;
 
 		list_for_each_entry(conf, &dev->configs, list_item) {
 			err = usb_add_config(cdev, &conf->usb_config,
@@ -495,6 +497,13 @@ static int android_enable(struct android_dev *dev)
 			if (err < 0) {
 				pr_err("%s: usb_add_config failed : err: %d\n",
 						__func__, err);
+				/* Rollback previously enabled configurations */
+				list_for_each_entry(rollback_conf, &dev->configs, list_item) {
+					if (rollback_conf == conf)
+						break;
+					usb_remove_config(cdev, &rollback_conf->usb_config);
+				}
+				dev->disable_depth++;  /* Restore depth */
 				return err;
 			}
 		}
@@ -2846,6 +2855,43 @@ static struct android_usb_function midi_function = {
 	.attributes	= midi_function_attributes,
 };
 #endif
+
+/* HID */
+static int hid_function_init(struct android_usb_function *f, struct usb_composite_dev *cdev)
+{
+    /* Chỉ cần kiểm tra hidg_class đã được tạo chưa */
+    if (!hidg_class) {
+        pr_err("hid_function_init: hidg_class is NULL, ghid_setup failed?\n");
+        return -ENODEV;
+    }
+    pr_debug("hid_function_init: OK\n");
+    return 0;
+}
+
+static int hid_function_bind_config(struct android_usb_function *f,
+                                    struct usb_configuration *c)
+{
+    int ret;
+    pr_debug("hid_function_bind_config: binding HID function (using default descriptor)\n");
+    ret = hidg_bind_config(c, NULL, 0);   // dùng descriptor mặc định từ f_hid.c
+    if (ret)
+        pr_err("hid_function_bind_config: failed (%d)\n", ret);
+    return ret;
+}
+
+static void hid_function_cleanup(struct android_usb_function *f)
+{
+    /* Không cần dọn dẹp gì đặc biệt */
+}
+
+static struct android_usb_function hid_function = {
+    .name        = "hid",
+    .init        = hid_function_init,
+    .cleanup     = hid_function_cleanup,
+    .bind_config = hid_function_bind_config,
+    /* không cần attributes, enable, disable, unbind_config, ctrlrequest */
+};
+
 static struct android_usb_function *supported_functions[] = {
 	&ffs_function,
 	&mbim_function,
@@ -2877,6 +2923,7 @@ static struct android_usb_function *supported_functions[] = {
 #ifdef CONFIG_SND_RAWMIDI
 	&midi_function,
 #endif
+	&hid_function,
 	NULL
 };
 
@@ -4064,10 +4111,18 @@ static int __init init(void)
 	INIT_LIST_HEAD(&android_dev_list);
 	android_dev_count = 0;
 
+	/* Initialize HID gadget driver */
+	ret = ghid_setup(NULL, 4);
+	if (ret) {
+		pr_err("%s(): Failed to setup HID gadget\n", __func__);
+		return ret;
+	}
+
 	ret = platform_driver_register(&android_platform_driver);
 	if (ret) {
 		pr_err("%s(): Failed to register android"
 				 "platform driver\n", __func__);
+		goto err_platform;
 	}
 
 	/* HACK: exchange composite's setup with ours */
@@ -4079,11 +4134,16 @@ static int __init init(void)
 	android_usb_driver.gadget_driver.resume = android_resume;
 
 	return ret;
+
+err_platform:
+	ghid_cleanup();
+	return ret;
 }
 late_initcall(init);
 
 static void __exit cleanup(void)
 {
 	platform_driver_unregister(&android_platform_driver);
+	ghid_cleanup();
 }
 module_exit(cleanup);
