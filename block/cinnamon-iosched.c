@@ -113,56 +113,60 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, struct request_queue
 	int old_pressure, curr_pressure;
 	int changed = 0;
 
-	/* Loop to handle race conditions properly */
 	do {
 		curr_pressure = atomic_read(&cinnamon_io_pressure);
 
-		/* If same pressure, no change needed */
 		if (new_pressure == curr_pressure)
 			return;
 
-		/* Check hysteresis - only allow changes after hysteresis period */
-		if (!time_after(jiffies, cd->last_pressure_change_jiffies + msecs_to_jiffies(cd->hysteresis_ms)))
-			return;
-
-		/* Priority-based pressure resolution:
-		 * - Higher pressure values (more urgent) take precedence
-		 * - 0 (idle) can be overridden by any non-zero
-		 * - Non-zero pressures cannot be overridden by 0 (idle)
-		 */
-		if (curr_pressure == 0 || new_pressure > curr_pressure) {
-			/* Attempt to set new pressure atomically */
-			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure, curr_pressure, new_pressure);
+		/* Cho phép set về 0 (idle) bất kỳ lúc nào */
+		if (new_pressure == 0) {
+			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure, curr_pressure, 0);
 			if (old_pressure == curr_pressure) {
-				/* Successfully set pressure */
 				cd->last_pressure_change_jiffies = jiffies;
 				changed = 1;
 
-				/* Race to Idle: smooth parameter transitions for eMMC compatibility */
-				if (new_pressure == 0) {
-					/* Save current values */
-					cd->saved_read_batch = cd->read_batch;
-					cd->saved_write_batch = cd->write_batch;
-					cd->saved_write_expire_ms = cd->write_expire_ms;
-					/* Reduce batch moderately for eMMC (don't go too low to maintain sequential write performance) */
-					cd->read_batch = max(cd->read_batch / 2, 8);  /* eMMC minimum: 8 */
-					cd->write_batch = max(cd->write_batch / 2, 8);  /* eMMC minimum: 8 */
-					cd->write_expire_ms = min(cd->write_expire_ms + 100, 300); /* Gradual increase */
-				} else if (curr_pressure == 0) {
-					/* Restore parameters when exiting idle */
+				/* Khôi phục tham số nếu đang ở chế độ idle */
+				if (curr_pressure != 0) {
 					cd->read_batch = cd->saved_read_batch;
 					cd->write_batch = cd->saved_write_batch;
 					cd->write_expire_ms = cd->saved_write_expire_ms;
 				}
 			}
-			/* If cmpxchg failed, another thread changed pressure, loop to retry */
+			break;
+		}
+
+		/* Kiểm tra hysteresis */
+		if (!time_after(jiffies, cd->last_pressure_change_jiffies + msecs_to_jiffies(cd->hysteresis_ms)))
+			return;
+
+		/* Ưu tiên: chỉ tăng áp lực hoặc từ 0 lên non-zero */
+		if (curr_pressure == 0 || new_pressure > curr_pressure) {
+			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure, curr_pressure, new_pressure);
+			if (old_pressure == curr_pressure) {
+				cd->last_pressure_change_jiffies = jiffies;
+				changed = 1;
+
+				/* Xử lý khi vào idle */
+				if (new_pressure == 0) {
+					cd->saved_read_batch = cd->read_batch;
+					cd->saved_write_batch = cd->write_batch;
+					cd->saved_write_expire_ms = cd->write_expire_ms;
+					cd->read_batch = max(cd->read_batch / 2, 8);
+					cd->write_batch = max(cd->write_batch / 2, 8);
+					cd->write_expire_ms = min(cd->write_expire_ms + 100, 300);
+				} else if (curr_pressure == 0) {
+					cd->read_batch = cd->saved_read_batch;
+					cd->write_batch = cd->saved_write_batch;
+					cd->write_expire_ms = cd->saved_write_expire_ms;
+				}
+			}
 		} else {
-			/* Lower priority pressure, don't override higher priority */
+			/* Không cho phép giảm áp lực (trừ về 0 đã xử lý ở trên) */
 			return;
 		}
 	} while (!changed);
 
-	/* If pressure changed, update read-ahead */
 	if (changed)
 		cinnamon_update_ra(cd, q);
 }
