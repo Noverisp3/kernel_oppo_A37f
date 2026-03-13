@@ -106,7 +106,9 @@ OPPO_CHARGER_EXT int opchg_masked_write(struct opchg_charger *chip, int reg, u8 
 OPPO_CHARGER_EXT int opchg_regulator_init(struct opchg_charger *chip);
 OPPO_CHARGER_EXT int opchg_check_i2c_status(struct opchg_charger *chip);
 
+#ifdef OPPO_USE_2CHARGER
 OPPO_CHARGER_EXT void opchg_get_prop_fastcharger_type(struct opchg_charger *chip);
+#endif
 OPPO_CHARGER_EXT void opchg_get_prop_charge_type(struct opchg_charger *chip);
 OPPO_CHARGER_EXT void opchg_get_charging_status(struct opchg_charger *chip);
 OPPO_CHARGER_EXT int opchg_get_prop_batt_status(struct opchg_charger *chip);

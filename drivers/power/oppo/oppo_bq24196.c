@@ -24,8 +24,6 @@ static int bq24196_usbin_input_current_limit[] = {
     1200,   1500,   2000,   3000,
 };
 
-extern int force_fast_charge;
-
 int bq24196_get_prop_charge_type(struct opchg_charger *chip)
 {
     int rc;
@@ -399,12 +397,6 @@ int bq24196_set_input_chg_current(struct opchg_charger *chip, int iusbin_mA, boo
 	int iusbmax = 0;
 
     chip->is_charger_det = 1;
-
-    /* USB Fast Charge: Force high current mode for forced fast charge */
-    if (force_fast_charge) {
-        iusbin_mA = 1500; /* Force 1.5A for fast charge */
-    } else {
-    }
 
 	if (iusbin_mA <= 2)
         iusbin_mA = USB2_MIN_CURRENT_MA;

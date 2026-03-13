@@ -488,31 +488,23 @@ int smb358_aicl_enable(struct opchg_charger *chip, bool enable)
 	return 0;
 }
 
-extern int force_fast_charge;
-
-int smb358_set_input_chg_current(struct opchg_charger *chip, int iusbin_mA, bool aicl_enable)
+int smb358_set_input_chg_current(struct opchg_charger *chip, int current_ma, bool aicl)
 {
-	int rc = 0;
-    int i;
+    int i, rc = 0;
     u8 reg1 = 0, reg2 = 0, mask = 0;
     //u8 val = 0;
+
+    dev_dbg(chip->dev, "%s: USB current_ma = %d\n", __func__, current_ma);
 
     if (chip->chg_autonomous_mode) {
         dev_dbg(chip->dev, "%s: Charger in autonmous mode\n", __func__);
         return 0;
     }
-
-    /* USB Fast Charge: Force high current mode for forced fast charge */
-    if (force_fast_charge && iusbin_mA < 1000) {
-        iusbin_mA = 1500; /* Force 1.5A for fast charge */
-    } else {
-    }
-
 	smb358_aicl_enable(chip, false);
 	smb358_aicl_enable(chip, true);
     #if 0
-    /* Only set suspend bit when chg present and iusbin_mA = 2 */
-    if (iusbin_mA == 2 && chip->chg_present) {
+    /* Only set suspend bit when chg present and current_ma = 2 */
+    if (current_ma == 2 && chip->chg_present) {
         rc = opchg_masked_write(chip, CMD_A_REG, CMD_A_CHG_SUSP_EN_MASK, CMD_A_CHG_SUSP_EN_BIT);
         if (rc < 0) {
 			dev_err(chip->dev, "Couldn't suspend rc = %d\n", rc);
@@ -522,37 +514,37 @@ int smb358_set_input_chg_current(struct opchg_charger *chip, int iusbin_mA, bool
     }
 	#endif
 
-	if (iusbin_mA <= 2)
-        iusbin_mA = USB2_MIN_CURRENT_MA;
-    else if (iusbin_mA <= USB2_MIN_CURRENT_MA)
-        iusbin_mA = USB2_MAX_CURRENT_MA;
+	if (current_ma <= 2)
+        current_ma = USB2_MIN_CURRENT_MA;
+    else if (current_ma <= USB2_MIN_CURRENT_MA)
+        current_ma = USB2_MAX_CURRENT_MA;
 
-    if (iusbin_mA == USB2_MIN_CURRENT_MA) {
+    if (current_ma == USB2_MIN_CURRENT_MA) {
         /* USB 2.0 - 100mA */
         reg1 &= ~USB3_ENABLE_BIT;
         reg2 &= ~CMD_B_CHG_USB_500_900_ENABLE_BIT;
 	}
-	else if (iusbin_mA == USB2_MAX_CURRENT_MA) {
+	else if (current_ma == USB2_MAX_CURRENT_MA) {
         /* USB 2.0 - 500mA */
         reg1 &= ~USB3_ENABLE_BIT;
         reg2 |= CMD_B_CHG_USB_500_900_ENABLE_BIT;
 	}
-	else if (iusbin_mA == USB3_MAX_CURRENT_MA) {
+	else if (current_ma == USB3_MAX_CURRENT_MA) {
         /* USB 3.0 - 900mA */
         reg1 |= USB3_ENABLE_BIT;
         reg2 |= CMD_B_CHG_USB_500_900_ENABLE_BIT;
 	}
-	else if (iusbin_mA > USB2_MAX_CURRENT_MA) {
+	else if (current_ma > USB2_MAX_CURRENT_MA) {
         /* HC mode  - if none of the above */
         reg2 |= CMD_B_CHG_HC_ENABLE_BIT;
 
         for (i = ARRAY_SIZE(input_current) - 1; i >= 0; i--) {
-            if (input_current[i] <= iusbin_mA) {
+            if (input_current[i] <= current_ma) {
                 break;
             }
         }
         if (i < 0) {
-            dev_err(chip->dev, "Cannot find %dmA\n", iusbin_mA);
+            dev_err(chip->dev, "Cannot find %dmA\n", current_ma);
             i = 0;
         }
 

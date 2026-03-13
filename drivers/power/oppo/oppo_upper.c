@@ -58,7 +58,6 @@ static enum power_supply_property pm_power_props_mains[] = {
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
-	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 };
 
 static void opchg_external_power_changed(struct power_supply *psy)
@@ -114,7 +113,7 @@ static void opchg_external_power_changed(struct power_supply *psy)
 	}
 
     opchg_config_over_time(chip, current_limit);//opchg_set_complete_charge_timeout(chip);
-	//dev_dbg(chip->dev, "%s set charger input current=%d,online = %d, current_limit = %d\n", __func__,chip->max_input_current[INPUT_CURRENT_MIN], online, current_limit);
+	dev_dbg(chip->dev, "%s set charger input current=%d,online = %d, current_limit = %d\n", __func__,chip->max_input_current[INPUT_CURRENT_MIN], online, current_limit);
 
     opchg_check_status(chip);
 	opchg_set_status(chip, true);//opchg_set_status(chip, false);
@@ -578,8 +577,7 @@ int opchg_battery_get_property(struct power_supply *psy,
 			}
 			else
 			{
-				// For BQ24196 and other non-VOOC chargers, use fastcharger_type for fast charging detection
-				chip->fastcharger = chip->fastcharger_type;
+				chip->fastcharger =0;
 			}
 			#else
 			chip->fastcharger =0;
@@ -716,10 +714,6 @@ int qpnp_power_get_property_mains(struct power_supply *psy,
 		{
 			val->intval = chip->max_input_current[INPUT_CURRENT_MIN] * 1000;
 		}
-		break;
-
-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		val->intval = chip->charger_vol * 1000; /* Convert to microvolts */
 		break;
 
 	default:
