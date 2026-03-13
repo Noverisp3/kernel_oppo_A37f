@@ -12,7 +12,33 @@
 #include <linux/spinlock.h>
 #include <linux/kernel.h>
 
+int spm_enabled = 0;
+
 /* SPM sysfs attributes */
+static ssize_t spm_enabled_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", spm_enabled);
+}
+
+static ssize_t spm_enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	int enable;
+	
+	if (sscanf(buf, "%d", &enable) != 1)
+		return -EINVAL;
+	
+	if (enable) {
+		if (!spm_scanner_thread)
+			spm_start_scanner();
+	} else {
+		if (spm_scanner_thread)
+			spm_stop_scanner();
+	}
+	
+	spm_enabled = enable ? 1 : 0;
+	return count;
+}
 static ssize_t spm_run_show(struct kobject *kobj, struct kobj_attribute *attr,
 			    char *buf)
 {
@@ -131,6 +157,8 @@ static struct kobj_attribute spm_merge_threshold_attr = __ATTR(merge_threshold, 
 static struct kobj_attribute spm_enable_fork_sharing_attr = __ATTR(enable_fork_sharing, 0644,
 								    spm_enable_fork_sharing_show,
 								    spm_enable_fork_sharing_store);
+static struct kobj_attribute spm_enabled_attr = __ATTR(enabled, 0644,
+						       spm_enabled_show, spm_enabled_store);
 
 static struct attribute *spm_attrs[] = {
 	&spm_run_attr.attr,
@@ -140,6 +168,7 @@ static struct attribute *spm_attrs[] = {
 	&spm_scan_period_ms_attr.attr,
 	&spm_merge_threshold_attr.attr,
 	&spm_enable_fork_sharing_attr.attr,
+	&spm_enabled_attr.attr,
 	NULL,
 };
 

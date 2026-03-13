@@ -46,6 +46,8 @@
 #define DO_NUMA(x)	do { } while (0)
 #endif
 
+#include <linux/module.h>
+
 /*
  * SPM page tracking structure with kref for safe lifecycle management
  */
@@ -65,7 +67,7 @@ struct spm_page {
 
 /* SPM Configuration */
 struct spm_config spm_cfg = {
-	.scan_period_ms = 100,		/* Fast scanning - 100ms */
+	.scan_period_ms = 200,		/* Fast scanning - 200ms */
 	.max_merge_age = 5,		/* Merge after 5 scans */
 	.hash_buckets = 4096,		/* 4K hash buckets */
 	.enable_fork_sharing = false,	/* Disable sharing to avoid deadlock */
@@ -79,6 +81,8 @@ static void spm_page_release(struct kref *ref);
 static void spm_mm_rcu_free(struct rcu_head *rcu);
 static void spm_owner_entry_rcu_free(struct rcu_head *rcu);
 void spm_scan_pages(void);    /* ← thêm dòng này */
+
+extern int spm_enabled;
 
 /*
  * RCU callback for spm_owner_entry
@@ -897,11 +901,13 @@ static int __init spm_init(void)
 	atomic_long_set(&spm_owner_id_counter, 0);
 	
 	/* Start scanner */
-	ret = spm_start_scanner();
-	if (ret) {
-		destroy_workqueue(spm_wq);
-		pr_err("SPM: Failed to start scanner: %d\n", ret);
-		return ret;
+	if (spm_enabled) {
+		ret = spm_start_scanner();
+		if (ret) {
+			destroy_workqueue(spm_wq);
+			pr_err("SPM: Failed to start scanner: %d\n", ret);
+			return ret;
+		}
 	}
 	
 	/* Initialize sysfs interface */
