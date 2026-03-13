@@ -40,23 +40,11 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <soc/qcom/core_ctl.h>
-#include <linux/cpufreq.h>
-#include <linux/workqueue.h>
-#include <linux/cpu.h>
-#include <linux/cpumask.h>
-#include <linux/completion.h>
-#include <linux/module.h>
-#include <linux/pm.h>
-#include <linux/fb.h>
-#include <linux/notifier.h>
-#include <trace/events/power.h>
-#include "../../power/oppo/oppo_inc.h"
+#include <linux/mutex.h>
 
-extern struct cpufreq_governor cpufreq_gov_powersave;
-extern struct cpufreq_governor cpufreq_gov_interactive;
+#include <trace/events/power.h>
 
 #define MAX_CPUS_PER_GROUP 4
-#define OFFLINE_TIMEOUT_MS 2000
 
 struct cpu_data {
 	/* Per CPU data. */
@@ -92,11 +80,7 @@ struct cpu_data {
 	struct timer_list timer;
 	struct task_struct *hotplug_thread;
 	struct kobject kobj;
-	
-	/* Completion for hotplug synchronization */
-	struct completion offline_done;
 	struct list_head pending_lru;
-	bool is_locked;
 };
 
 static DEFINE_PER_CPU(struct cpu_data, cpu_state);
@@ -104,403 +88,10 @@ static DEFINE_SPINLOCK(state_lock);
 static DEFINE_SPINLOCK(pending_lru_lock);
 static DEFINE_MUTEX(lru_lock);
 
-static unsigned int default_min_freq[NR_CPUS];
-static unsigned int default_max_freq[NR_CPUS];
-static struct work_struct screen_on_work;
-static struct delayed_work screen_off_work;
-static bool screen_off_active = false;
-static unsigned long sleep_start_jiffies;
-int sleep_state = 0;
-#define freq_locked sleep_state
-
-static DEFINE_MUTEX(core_ctl_mutex);
-static atomic_t hotplug_refcount = ATOMIC_INIT(0);
-
-static void wake_up_hotplug_thread(struct cpu_data *state);
 static void apply_need(struct cpu_data *f);
-
-static void __ref screen_on_work_func(struct work_struct *work)
-{
-	int cpu;
-	struct cpufreq_policy *policy;
-	int i;
-	int retry_count = 0;
-	const int max_retries = 3;
-	int recovery_attempted = 0;
-	struct opchg_charger *chip;
-
-	/* DEADLOCK PROTECTION: Ensure not in interrupt context */
-	if (in_interrupt() || irqs_disabled()) {
-		pr_err("CSleep: ERROR - screen_on_work_func called in interrupt context!\n");
-		return;
-	}
-
-	/* Mở khóa CPU Hotplug trước - với deadlock protection */
-	mutex_lock(&core_ctl_mutex);  /* Protect against nested calls */
-	if (atomic_read(&hotplug_refcount) > 0) {
-		pr_warn("CSleep: WARNING - CPU hotplug already enabled (refcount=%d), skipping\n", 
-			atomic_read(&hotplug_refcount));
-	} else {
-		cpu_hotplug_enable();
-		atomic_inc(&hotplug_refcount);
-	}
-	mutex_unlock(&core_ctl_mutex);
-
-	/* Recovery function cho trường hợp miss re-enable */
-recovery_retry:
-	if (retry_count > 0 || recovery_attempted) {
-		pr_info("CSleep: Starting recovery attempt %d/%d\n", retry_count + 1, max_retries);
-		recovery_attempted = 1;
-	}
-
-	/* Giải phóng dải tần số */
-	freq_locked = 0;
-	for_each_online_cpu(cpu) {
-		policy = cpufreq_cpu_get(cpu);
-		if (policy) {
-			/* Use proper cpufreq API to set limits safely */
-			policy->user_policy.min = default_min_freq[cpu];
-			policy->user_policy.max = default_max_freq[cpu];
-			
-			/* Use cpufreq_update_policy() which handles locking internally */
-			cpufreq_update_policy(cpu);
-			cpufreq_cpu_put(policy);
-			
-			/* Verify policy was applied correctly */
-			policy = cpufreq_cpu_get(cpu);
-			if (policy) {
-				if (WARN_ON(policy->min != default_min_freq[cpu] ||
-				    policy->max != default_max_freq[cpu] ||
-				    policy->user_policy.min != default_min_freq[cpu] ||
-				    policy->user_policy.max != default_max_freq[cpu])) {
-					pr_warn("CSleep: Policy verification failed for CPU%d, retrying...\n", cpu);
-					/* Thử đặt lại policy */
-					policy->user_policy.min = default_min_freq[cpu];
-					policy->user_policy.max = default_max_freq[cpu];
-					cpufreq_update_policy(cpu);
-				} else {
-					pr_debug("CSleep: CPU%d policy restored min=%u max=%u\n", 
-						cpu, policy->min, policy->max);
-				}
-				cpufreq_cpu_put(policy);
-			}
-		}
-	}
-
-	/* Verify frequency recovery - check if frequencies are properly restored */
-	for_each_possible_cpu(cpu) {
-		policy = cpufreq_cpu_get(cpu);
-		if (policy) {
-			if (policy->min != default_min_freq[cpu] ||
-			    policy->max != default_max_freq[cpu]) {
-				pr_warn("CSleep: Frequency recovery failed for CPU%d, retrying...\n", cpu);
-				cpufreq_cpu_put(policy);
-				if (retry_count < max_retries) {
-					retry_count++;
-					msleep(100); /* Wait 100ms before retry */
-					goto recovery_retry;
-				}
-			}
-			cpufreq_cpu_put(policy);
-		}
-	}
-
-	pr_info("CSleep: Screen on detected! Governor Unfrozen.\n");
-	if (sleep_start_jiffies) {
-		if (jiffies >= sleep_start_jiffies) {
-			unsigned long sleep_duration_ms = jiffies_to_msecs(jiffies - sleep_start_jiffies);
-			pr_info("CSleep: CPU was in sleep state for %lu s\n", sleep_duration_ms / 1000);
-		} else {
-			pr_info("CSleep: Sleep state duration error\n");
-		}
-		sleep_start_jiffies = 0;
-	}
-
-	/* Khôi phục cài đặt Hotplug để các nhân khác có thể online */
-	for_each_possible_cpu(i) {
-		struct cpu_data *f = &per_cpu(cpu_state, i);
-		if (!f->inited || f->first_cpu != i)
-			continue;
-		f->max_cpus = f->num_cpus;  // Use num_cpus instead of NR_CPUS
-		f->min_cpus = 1;
-		f->is_locked = 0;
-		wake_up_hotplug_thread(f);
-	}
-
-	/* Force bring cores online if missed - additional recovery */
-	for_each_possible_cpu(i) {
-		if (i == 0) continue;  // Skip CPU0 since it's always online
-		if (!cpu_online(i)) {
-			if (recovery_attempted)
-				pr_info("CSleep: Force bringing CPU%d online\n", i);
-			if (cpu_up(i) != 0) {
-				if (recovery_attempted)
-					pr_err("CSleep: Failed to bring CPU%d online\n", i);
-			}
-		}
-	}
-
-	/* Verify core recovery - ensure all cores are online */
-	for_each_possible_cpu(i) {
-		if (!cpu_online(i)) {
-			pr_warn("CSleep: CPU%d still offline after recovery attempt %d\n", i, retry_count + 1);
-			if (retry_count < max_retries) {
-				retry_count++;
-				msleep(200);
-				goto recovery_retry;
-			}
-		}
-	}
-
-    /* Restart charger update thread */
-	chip = (struct opchg_charger *)opchg_chip;
-	if (chip) {
-		/* Hủy work cũ nếu đang chạy (tránh chồng chéo) */
-		cancel_delayed_work_sync(&chip->update_opchg_thread_work);
-		/* Schedule lại sau 100ms */
-		schedule_delayed_work(&chip->update_opchg_thread_work,
-		                      msecs_to_jiffies(100));
-		pr_debug("CSleep: Charger update thread rescheduled\n");
-	} else {
-		pr_err("CSleep: opchg_chip is NULL, cannot restart charger\n");
-	}
-
-	if (recovery_attempted) {
-		pr_info("CSleep: Recovery completed successfully after %d attempts\n", retry_count + 1);
-	}
-}
-
-static void __ref screen_off_work_func(struct work_struct *work)
-{
-	int i;
-	struct cpufreq_policy *policy;
-	unsigned int cpu = 0; // Tập trung khóa CPU0 vì đây là nhân duy nhất được giữ lại
-	int retry_count = 0;
-	const int max_retries = 3;
-	int cores_disabled = 0;
-	int freq_frozen = 0;
-	int recovery_attempted = 0;
-	struct opchg_charger *chip;
-	int offline_timeout;
-	struct cpu_data *cpu_ptr;  // C90: declare at beginning
-
-	/* DEADLOCK PROTECTION: Ensure not in interrupt context */
-	if (in_interrupt() || irqs_disabled()) {
-		pr_err("CSleep: ERROR - screen_off_work_func called in interrupt context!\n");
-		return;
-	}
-
-	/* Recovery function cho screen off */
-screen_off_retry:
-	if (retry_count > 0 || recovery_attempted) {
-		pr_info("CSleep: Starting screen off recovery attempt %d/%d\n", retry_count + 1, max_retries);
-		recovery_attempted = 1;
-	}
-
-	cores_disabled = 0;
-	freq_frozen = 0;
-
-	/* Reinit completions trước khi kích hoạt hotplug */
-	for_each_possible_cpu(i) {
-		if (i == 0) continue;
-		cpu_ptr = &per_cpu(cpu_state, i);
-		if (cpu_ptr->inited)
-			init_completion(&cpu_ptr->offline_done);
-	}
-
-	/* 1. Force hệ thống chỉ dùng 1 nhân (CPU0) */
-	for_each_possible_cpu(i) {
-		struct cpu_data *f = &per_cpu(cpu_state, i);
-		if (!f->inited || f->first_cpu != i)
-			continue;
-		f->max_cpus = 1;
-		f->min_cpus = 1;
-		f->is_locked = 1;
-		wake_up_hotplug_thread(f);
-	}
-
-	/* Verify cores are being disabled */
-	for_each_possible_cpu(i) {
-		if (i == 0) continue;  // Skip CPU0 since it stays online
-		if (cpu_online(i)) {
-			if (recovery_attempted) {
-				pr_info("CSleep: CPU%d still online, will be disabled by hotplug\n", i);
-			}
-		} else {
-			cores_disabled++;
-		}
-	}
-
-	/* 2. Thực hiện đóng băng dải tần của Governor */
-	if (screen_off_active) {
-		freq_locked = 1;
-		policy = cpufreq_cpu_get(cpu);
-		if (policy) {
-			/* Khóa Min ở mức 400MHz, Max ở mức 800MHz */
-			policy->user_policy.min = 400000;
-			policy->user_policy.max = 800000;
-
-			/* Use proper cpufreq API to apply frequency changes */
-			cpufreq_update_policy(cpu);
-			cpufreq_cpu_put(policy);
-
-			/* Verify frequency freeze was applied correctly */
-			policy = cpufreq_cpu_get(cpu);
-			if (policy) {
-				if (WARN_ON(policy->min != 400000 ||
-				    policy->max != 800000 ||
-				    policy->user_policy.min != 400000 ||
-				    policy->user_policy.max != 800000)) {
-					pr_warn("CSleep: Frequency freeze failed for CPU%d, retrying...\n", cpu);
-					/* Thử đặt lại frequency */
-					policy->user_policy.min = 400000;
-					policy->user_policy.max = 800000;
-					cpufreq_update_policy(cpu);
-				} else {
-					pr_debug("CSleep: CPU%d frequency frozen min=%u max=%u\n", 
-						cpu, policy->min, policy->max);
-					freq_frozen = 1;  /* Set after successful verification */
-				}
-				cpufreq_cpu_put(policy);
-			}
-		}
-
-		/* Stop charger update thread to prevent wake */
-		chip = (struct opchg_charger *)opchg_chip;
-		if (chip && chip->is_charging && chip->bat_volt_check_point >= 10) {
-			cancel_delayed_work_sync(&chip->update_opchg_thread_work);
-		}
-
-		/* Check if operations completed successfully */
-		if (cores_disabled >= (num_possible_cpus() - 1) && freq_frozen) {
-			pr_info("CSleep: Screen off detected! Governor Frozen at 400-800MHz\n");
-			if (recovery_attempted) {
-				pr_info("CSleep: Screen off recovery completed successfully after %d attempts\n", retry_count + 1);
-			}
-			sleep_start_jiffies = jiffies;
-		} else {
-			pr_warn("CSleep: Screen off operations incomplete (cores:%d/%d, freq:%d), retrying...\n",
-				cores_disabled, num_possible_cpus() - 1, freq_frozen);
-			if (retry_count < max_retries) {
-				retry_count++;
-				msleep(150); /* Wait 150ms before retry */
-				goto screen_off_retry;
-			} else {
-				pr_err("CSleep: Screen off recovery failed after %d attempts\n", max_retries);
-				pr_info("CSleep: Screen off detected! Governor Frozen at 400-800MHz (partial)\n");
-				sleep_start_jiffies = jiffies;
-			}
-		}
-	}
-
-	/* DEADLOCK PROTECTION: Disable CPU hotplug AFTER hotplug thread had chance to run */
-	/* Add delay to let hotplug thread complete offline operations */
-	msleep(50);  // Cho hotplug thread có thời gian chạy
-	
-	/* Wait for all CPUs to go offline with timeout */
-	offline_timeout = 0;
-	for_each_possible_cpu(i) {
-		if (i == 0) continue;  // Skip CPU0 since it stays online
-		cpu_ptr = &per_cpu(cpu_state, i);  // C90: assignment only
-	}
-	
-	/* Wait for each CPU to go offline with timeout */
-	offline_timeout = 0;
-	for_each_possible_cpu(i) {
-		if (i == 0) continue;  // Skip CPU0 since it stays online
-		cpu_ptr = &per_cpu(cpu_state, i);  // C90: assignment only
-		if (cpu_ptr->inited) {
-			if (!wait_for_completion_timeout(&cpu_ptr->offline_done,
-					msecs_to_jiffies(OFFLINE_TIMEOUT_MS))) {
-				/* Check if CPU is actually offline - if so, don't report anything */
-				if (!cpu_online(i)) {
-					/* CPU is offline, just continue silently */
-					continue;
-				}
-				/* Only report timeout if CPU is actually still online */
-				pr_warn("CSleep: Timeout waiting for CPU%d offline, state=online\n", i);
-				offline_timeout++;
-			} else {
-				pr_debug("CSleep: CPU%d offline completed\n", i);
-			}
-		}
-	}
-	
-	/* Check CPU online status after waiting */
-	cores_disabled = 0;
-	for_each_possible_cpu(i) {
-		if (i == 0) continue;
-		if (!cpu_online(i))
-			cores_disabled++;
-	}
-	
-	/* Only report if CPUs are actually still online */
-	if (cores_disabled < (num_possible_cpus() - 1)) {
-		int still_online = (num_possible_cpus() - 1) - cores_disabled;
-		pr_warn("CSleep: %d CPUs still online after waiting\n", still_online);
-	} else {
-		pr_info("CSleep: All non-boot CPUs successfully offline\n");
-	}
-	
-	mutex_lock(&core_ctl_mutex);
-if (atomic_read(&hotplug_refcount) > 0) {
-	cpu_hotplug_disable();
-	atomic_dec(&hotplug_refcount);
-	pr_info("CSleep: CPU hotplug disabled (refcount=%d)\n",
-			atomic_read(&hotplug_refcount));
-} else {
-	pr_warn("CSleep: CPU hotplug already disabled (refcount=%d)\n",
-			atomic_read(&hotplug_refcount));
-}
-mutex_unlock(&core_ctl_mutex);
-}
-
-static int screen_state_cb(struct notifier_block *nb, unsigned long val, void *data)
-{
-	struct fb_event *evdata = data;
-	unsigned int blank;
-	int i;
-
-	if (val != FB_EVENT_BLANK)
-		return 0;
-
-	blank = *(int *)evdata->data;
-
-	for_each_possible_cpu(i) {
-		struct cpu_data *f = &per_cpu(cpu_state, i);
-		if (!f->inited || f->first_cpu != i)
-			continue;
-
-		if (blank == FB_BLANK_UNBLANK) {
-			/* Screen on: allow up to 4 CPUs */
-			f->max_cpus = f->num_cpus;
-			f->min_cpus = 1;
-			f->task_thres = UINT_MAX; // Restore task-based onlining
-			f->is_locked = 0; // Unlock to allow other drivers to change
-			screen_off_active = false;
-			cancel_delayed_work_sync(&screen_off_work); // Hủy lệnh hạ xung nếu người dùng bật lại nhanh
-			/* Defer restore default min freq */
-			schedule_work(&screen_on_work);
-		} else {
-			/* Screen off: force to 1 CPU */
-			f->max_cpus = 1;
-			f->min_cpus = 1;
-			f->need_cpus = 1;
-			f->task_thres = 0; // Prevent onlining extra CPUs based on tasks
-			f->is_locked = 1; // Lock to prevent other drivers from interfering
-			screen_off_active = true;
-			/* Defer set low min freq after 5 seconds */
-			schedule_delayed_work(&screen_off_work, msecs_to_jiffies(5000));
-		}
-		wake_up_hotplug_thread(f);
-	}
-
-	return NOTIFY_OK;
-}
-
-static struct notifier_block screen_nb = {
-	.notifier_call = screen_state_cb,
-};
+static void wake_up_hotplug_thread(struct cpu_data *state);
+static void add_to_pending_lru(struct cpu_data *state);
+static void update_lru(struct cpu_data *state);
 
 /* ========================= sysfs interface =========================== */
 
@@ -508,9 +99,6 @@ static ssize_t store_min_cpus(struct cpu_data *state,
 				const char *buf, size_t count)
 {
 	unsigned int val;
-
-	if (state->is_locked)
-		return -EPERM;
 
 	if (sscanf(buf, "%u\n", &val) != 1)
 		return -EINVAL;
@@ -530,9 +118,6 @@ static ssize_t store_max_cpus(struct cpu_data *state,
 				const char *buf, size_t count)
 {
 	unsigned int val;
-
-	if (state->is_locked)
-		return -EPERM;
 
 	if (sscanf(buf, "%u\n", &val) != 1)
 		return -EINVAL;
@@ -1129,29 +714,13 @@ static void __ref do_hotplug(struct cpu_data *f)
 			if (f->online_cpus == need)
 				break;
 
-			/* Don't offline CPU0 */
-			if (c->cpu == 0)
-				continue;
-
-			/* Don't offline busy CPUs, unless locked */
-			if (c->is_busy && !f->is_locked)
+			/* Don't offline busy CPUs. */
+			if (c->is_busy)
 				continue;
 
 			pr_debug("Trying to Offline CPU%u\n", c->cpu);
-			if (cpu_online(c->cpu)) {
-				if (cpu_down(c->cpu)) {
-					pr_err("core_ctl: Failed to offline CPU%u\n", c->cpu);
-					/* Không gọi completion vì CPU vẫn online */
-				} else {
-					/* Signal completion when CPU successfully goes offline */
-					struct cpu_data *cpu_ptr = &per_cpu(cpu_state, c->cpu);
-					if (cpu_ptr->inited) {
-						complete(&cpu_ptr->offline_done);
-					}
-				}
-			} else {
-				pr_debug("CPU%u already offline, skipping cpu_down\n", c->cpu);
-			}
+			if (cpu_down(c->cpu))
+				pr_debug("Unable to Offline CPU%u\n", c->cpu);
 		}
 
 		/*
@@ -1168,29 +737,9 @@ static void __ref do_hotplug(struct cpu_data *f)
 			if (f->online_cpus <= f->max_cpus)
 				break;
 
-			/* Don't offline CPU0 */
-			if (c->cpu == 0)
-				continue;
-
-			/* Don't offline busy CPUs, unless locked */
-			if (c->is_busy && !f->is_locked)
-				continue;
-
 			pr_debug("Trying to Offline CPU%u\n", c->cpu);
-			if (cpu_online(c->cpu)) {
-				if (cpu_down(c->cpu)) {
-					pr_err("core_ctl: Failed to offline CPU%u\n", c->cpu);
-					/* Không gọi completion vì CPU vẫn online */
-				} else {
-					/* Signal completion when CPU successfully goes offline */
-					struct cpu_data *cpu_ptr = &per_cpu(cpu_state, c->cpu);
-					if (cpu_ptr->inited) {
-						complete(&cpu_ptr->offline_done);
-					}
-				}
-			} else {
-				pr_debug("CPU%u already offline, skipping cpu_down\n", c->cpu);
-			}
+			if (cpu_down(c->cpu))
+				pr_debug("Unable to Offline CPU%u\n", c->cpu);
 		}
 	} else if (f->online_cpus < need) {
 		list_for_each_entry_safe(c, tmp, &f->lru, sib) {
@@ -1207,6 +756,7 @@ static void __ref do_hotplug(struct cpu_data *f)
 		if (f->online_cpus == need)
 			goto done;
 
+
 		list_for_each_entry_safe(c, tmp, &f->lru, sib) {
 			if (c->online || c->rejected || !c->not_preferred)
 				continue;
@@ -1216,7 +766,6 @@ static void __ref do_hotplug(struct cpu_data *f)
 			pr_debug("Trying to Online CPU%u\n", c->cpu);
 			if (core_ctl_online_core(c->cpu))
 				pr_debug("Unable to Online CPU%u\n", c->cpu);
-			/* Note: Don't call completion here - only call when CPU goes offline */
 		}
 	}
 done:
@@ -1418,7 +967,6 @@ static int group_init(struct cpumask *mask)
 	spin_lock_init(&f->pending_lock);
 	f->timer.function = core_ctl_timer_func;
 	f->timer.data = first_cpu;
-	f->is_locked = false;
 
 	for_each_cpu(cpu, mask) {
 		pr_info("Init CPU%u state\n", cpu);
@@ -1443,7 +991,6 @@ static int group_init(struct cpumask *mask)
 	for_each_cpu(cpu, mask) {
 		state = &per_cpu(cpu_state, cpu);
 		state->inited = true;
-		init_completion(&state->offline_done);  // Initialize completion for each CPU
 	}
 
 	kobject_init(&f->kobj, &ktype_core_ctl);
@@ -1507,20 +1054,6 @@ static int __init core_ctl_init(void)
 	}
 	core_ctl_unblock_hotplug();
 	mod_timer(&rq_avg_timer, round_to_nw_start());
-
-	/* Initialize default_min_freq with current min freq */
-	for_each_possible_cpu(cpu) {
-		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
-		if (policy) {
-			default_min_freq[cpu] = policy->min;
-			default_max_freq[cpu] = policy->max;
-			cpufreq_cpu_put(policy);
-		}
-	}
-
-	fb_register_client(&screen_nb);
-	INIT_WORK(&screen_on_work, screen_on_work_func);
-	INIT_DELAYED_WORK(&screen_off_work, screen_off_work_func);
 	return 0;
 }
 
@@ -1533,8 +1066,6 @@ static void __exit core_ctl_exit(void)
 	cpufreq_unregister_notifier(&cpufreq_pol_nb, CPUFREQ_POLICY_NOTIFIER);
 	cpufreq_unregister_notifier(&cpufreq_gov_nb, CPUFREQ_GOVINFO_NOTIFIER);
 	del_timer_sync(&rq_avg_timer);
-
-	fb_unregister_client(&screen_nb);
 
 	for_each_possible_cpu(cpu) {
 		pcpu = &per_cpu(cpu_state, cpu);
