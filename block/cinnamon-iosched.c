@@ -10,6 +10,9 @@
  * 6. Per-Queue State: Ensures SMP safety with isolated state per device.
  * 7. Latency Monitoring: Tracks and exposes average request latency via sysfs.
  * 8. Moving Average: Smooth latency reporting with historical weighting.
+ * 9. TRIM Priority: Dedicated queue for DISCARD commands (avoids fsync delays).
+ * 10. Starvation Counter & Auto-Recovery: Detects severe write starvation (>300ms)
+ *     and temporarily reduces read_batch to 4 for 2 seconds.
  */
 
 #include <linux/blkdev.h>
@@ -20,6 +23,9 @@
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/backing-dev.h>
+#include <linux/ktime.h>
+#include <linux/fs.h>          /* for disk_devt */
+#include <linux/genhd.h>       /* for disk_devt */
 
 /* TUNABLES */
 #define CINNAMON_WRITE_EXPIRE  (HZ / 8)  /* 125ms - Faster response */
@@ -30,18 +36,29 @@
 #define CINNAMON_TARGET_LATENCY_MS 50   /* mục tiêu latency 50ms */
 #define CINNAMON_ADJUST_INTERVAL_MS 2000 /* điều chỉnh mỗi 2 giây */
 #define INTERACTIVE_TIMEOUT (HZ)  /* 1 giây */
+#define WRITE_STARVE_THRESH_NS 300000000ULL /* 300ms in nanoseconds */
+
+/* eMMC major number */
+#define EMMC_MAJOR 179
+
+/* eMMC specific caps */
+#define EMMC_MAX_BATCH 16
+#define EMMC_MIN_PRESSURE_THRES 12
+#define EMMC_MAX_PRESSURE_THRES 24
 
 struct cinnamon_data {
 	struct list_head read_queue;
 	struct list_head write_queue;
+	struct list_head trim_queue;          /* dedicated queue for DISCARD */
 	unsigned int batch_count;
 	/* Stats for pressure monitoring */
 	int write_cnt;
 	int read_cnt;
+	int trim_cnt;                          /* counter for TRIM requests */
 	/* Read batch counter for write interleaving */
 	unsigned int read_batch_count;
-	/* Latency tracking */
-	atomic64_t total_latency;
+	/* Latency tracking (in ns) */
+	atomic64_t total_latency_ns;
 	atomic_t num_requests;
 	/* Per-queue read-ahead pressure tracking */
 	int last_ra_pressure;
@@ -63,6 +80,12 @@ struct cinnamon_data {
 	int last_read_direction;
 	/* Predicted next sector (0 if no prediction) */
 	sector_t predicted_sector;
+	/* History for write pattern detection */
+	sector_t write_history[CINNAMON_HISTORY_SIZE];
+	int write_history_index;
+	int write_history_count;
+	int last_write_direction;
+	sector_t predicted_write_sector;
 	/* Adaptive tuning */
 	unsigned long last_adjust_jiffies;
 	int target_latency_ms;
@@ -77,18 +100,61 @@ struct cinnamon_data {
 	struct request_queue *q;   /* để lấy ra_pages trong sysfs */
 	/* Dispatch sequence counter for optimization */
 	int dispatch_seq;
+	/* Per-queue empty dispatch counter (replaces static) */
+	int empty_dispatch_count;
+	/* eMMC mode detection / forcing */
+	bool emmc_mode;
+
+	/* --- Starvation counter & auto-recovery --- */
+	unsigned int write_starved_count;       /* number of severe starvations (>300ms) */
+	unsigned long last_starved_jiffies;     /* last time such starvation occurred */
+	unsigned long starvation_recovery_until; /* jiffies when recovery ends (0 = not active) */
+	int saved_read_batch_for_starve;        /* read_batch saved before recovery */
 };
 
-/* * Global atomic variable for CC engine
- * 0: Idle
- * 1: Read heavy (Urgent)
- * 2: Write heavy (Batching)
- * 3: Congested (Stop compressing, flush disk!)
- */
+/* Global atomic variable for CC engine */
 atomic_t cinnamon_io_pressure = ATOMIC_INIT(0);
 EXPORT_SYMBOL(cinnamon_io_pressure);
 
 #define CINNAMON_HYSTERESIS_MS 40
+
+/* Helpers for storing/retrieving 64-bit ns timestamps in elv.priv[] */
+static inline void set_req_time(struct request *rq, u64 time_ns)
+{
+#if BITS_PER_LONG == 64
+	rq->elv.priv[0] = (void *)time_ns;
+#else
+	rq->elv.priv[0] = (void *)(unsigned long)(time_ns & 0xFFFFFFFF);
+	rq->elv.priv[1] = (void *)(unsigned long)(time_ns >> 32);
+#endif
+}
+
+static inline u64 get_req_time(struct request *rq)
+{
+#if BITS_PER_LONG == 64
+	return (u64)(unsigned long)rq->elv.priv[0];
+#else
+	u64 low = (u64)(unsigned long)rq->elv.priv[0];
+	u64 high = (u64)(unsigned long)rq->elv.priv[1];
+	return (high << 32) | low;
+#endif
+}
+
+/* Clamp tunables for eMMC */
+static void cinnamon_clamp_for_emmc(struct cinnamon_data *cd)
+{
+	if (!cd->emmc_mode)
+		return;
+
+	if (cd->read_batch > EMMC_MAX_BATCH)
+		cd->read_batch = EMMC_MAX_BATCH;
+	if (cd->write_batch > EMMC_MAX_BATCH)
+		cd->write_batch = EMMC_MAX_BATCH;
+	if (cd->pressure_thres < EMMC_MIN_PRESSURE_THRES)
+		cd->pressure_thres = EMMC_MIN_PRESSURE_THRES;
+	if (cd->pressure_thres > EMMC_MAX_PRESSURE_THRES)
+		cd->pressure_thres = EMMC_MAX_PRESSURE_THRES;
+}
 
 static void cinnamon_update_ra(struct cinnamon_data *cd, struct request_queue *q)
 {
@@ -101,7 +167,6 @@ static void cinnamon_update_ra(struct cinnamon_data *cd, struct request_queue *q
 		else ra_kb = 512;
 		{
 			unsigned int ra_pages = ra_kb >> (PAGE_SHIFT - 10);
-			/* Thay WRITE_ONCE bằng gán trực tiếp (an toàn trong ngữ cảnh này) */
 			q->backing_dev_info.ra_pages = clamp(ra_pages, 16U, 4096U);
 		}
 		cd->last_ra_pressure = curr_press;
@@ -160,6 +225,8 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, struct request_queue
 					cd->write_batch = cd->saved_write_batch;
 					cd->write_expire_ms = cd->saved_write_expire_ms;
 				}
+				/* Clamp if eMMC */
+				cinnamon_clamp_for_emmc(cd);
 			}
 		} else {
 			/* Không cho phép giảm áp lực (trừ về 0 đã xử lý ở trên) */
@@ -186,7 +253,7 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 		int confidence;
 		
 		/* Calculate differences and statistics */
-		for (i = 1; i < min(5, cd->history_count); i++) { /* Use up to 5 samples */
+		for (i = 1; i < min(5, cd->history_count); i++) {
 			int cur = (cd->history_index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 			int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 			sector_t diff = cd->read_history[cur] - cd->read_history[prev];
@@ -202,7 +269,7 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 			total_diffs++;
 			
 			/* Check consistency within reasonable bounds */
-			if (abs(diff - avg_diff) < 1024) /* Within 4KB pages */
+			if (abs(diff - avg_diff) < 1024)
 				consistent++;
 		}
 		
@@ -211,7 +278,7 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 		
 		/* Only predict if confidence is high and pattern is sequential */
 		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 && 
-		    avg_diff != 0 && abs(avg_diff) < 1048576) { /* Within 4GB */
+		    avg_diff != 0 && abs(avg_diff) < 1048576) {
 			cd->predicted_sector = cd->read_history[idx] + avg_diff;
 			cd->last_read_direction = avg_diff > 0 ? 1 : -1;
 		} else {
@@ -222,6 +289,55 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 	} else {
 		cd->predicted_sector = 0;
 		cd->last_read_direction = 0;
+	}
+}
+
+static void cinnamon_update_write_history(struct cinnamon_data *cd, sector_t sector)
+{
+	cd->write_history[cd->write_history_index] = sector;
+	cd->write_history_index = (cd->write_history_index + 1) % CINNAMON_HISTORY_SIZE;
+	if (cd->write_history_count < CINNAMON_HISTORY_SIZE)
+		cd->write_history_count++;
+
+	/* Similar prediction for writes */
+	if (cd->write_history_count >= 3) {
+		int i, consistent = 0, total_diffs = 0;
+		sector_t avg_diff = 0, min_diff = 0, max_diff = 0;
+		int idx = (cd->write_history_index - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
+		int confidence;
+		
+		for (i = 1; i < min(5, cd->write_history_count); i++) {
+			int cur = (cd->write_history_index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
+			int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
+			sector_t diff = cd->write_history[cur] - cd->write_history[prev];
+			
+			if (i == 1) {
+				min_diff = max_diff = diff;
+				avg_diff = diff;
+			} else {
+				min_diff = min(min_diff, diff);
+				max_diff = max(max_diff, diff);
+				avg_diff = (avg_diff * (i-1) + diff) / i;
+			}
+			total_diffs++;
+			
+			if (abs(diff - avg_diff) < 1024)
+				consistent++;
+		}
+		
+		confidence = consistent * 100 / total_diffs;
+		
+		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 && 
+		    avg_diff != 0 && abs(avg_diff) < 1048576) {
+			cd->predicted_write_sector = cd->write_history[idx] + avg_diff;
+			cd->last_write_direction = avg_diff > 0 ? 1 : -1;
+		} else {
+			cd->predicted_write_sector = 0;
+			cd->last_write_direction = 0;
+		}
+	} else {
+		cd->predicted_write_sector = 0;
+		cd->last_write_direction = 0;
 	}
 }
 
@@ -260,7 +376,6 @@ static bool is_interactive_process(struct cinnamon_data *cd, struct request *rq)
 
 	/* Enhanced heuristic: small requests from non-nice processes */
 	if (blk_rq_bytes(rq) <= 16 * 1024 && task_nice(current) <= 5) {
-		/* Allow larger requests (16KB) for potentially interactive processes */
 		cd->last_interactive_pid = pid;
 		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
 		return true;
@@ -268,7 +383,6 @@ static bool is_interactive_process(struct cinnamon_data *cd, struct request *rq)
 
 	/* Check for frequent small I/O pattern (interactive behavior) */
 	if (cd->last_interactive_pid == pid && blk_rq_bytes(rq) <= 64 * 1024) {
-		/* Recent interactive process doing I/O - likely still interactive */
 		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
 		return true;
 	}
@@ -279,13 +393,14 @@ static bool is_interactive_process(struct cinnamon_data *cd, struct request *rq)
 static void cinnamon_merged_requests(struct request_queue *q, struct request *rq,
 				      struct request *next)
 {
-	/* 1. Đưa khai báo biến lên đầu hàm (Đúng chuẩn C90) */
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 
-	/* 2. Sau đó mới đến các câu lệnh thực thi */
 	list_del_init(&next->queuelist);
 	
-	if (rq_data_dir(next) == WRITE) {
+	if (next->cmd_flags & REQ_DISCARD) {
+		if (cd->trim_cnt > 0)
+			cd->trim_cnt--;
+	} else if (rq_data_dir(next) == WRITE) {
 		if (cd->write_cnt > 0)
 			cd->write_cnt--;
 	} else {
@@ -338,7 +453,7 @@ static int cinnamon_merge(struct request_queue *q, struct request **req, struct 
 static void cinnamon_adjust_params(struct cinnamon_data *cd, struct request_queue *q)
 {
 	unsigned long now = jiffies;
-	u64 total;
+	u64 total_ns;
 	int num, avg_latency_ms;
 	int queue_depth = cd->read_cnt + cd->write_cnt;
 	int read_ratio = queue_depth ? (cd->read_cnt * 100) / queue_depth : 50;
@@ -353,77 +468,126 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd, struct request_queu
 
 	cd->last_adjust_jiffies = now;
 
-	/* Tính độ trễ trung bình gần đây */
-	total = atomic64_read(&cd->total_latency);
+	/* Tính độ trễ trung bình gần đây (ns -> ms) */
+	total_ns = atomic64_read(&cd->total_latency_ns);
 	num = atomic_read(&cd->num_requests);
 	if (num == 0)
 		return;
 
-	avg_latency_ms = (total / num) * 1000 / HZ;
+	avg_latency_ms = div64_u64(total_ns / num, 1000000); /* ns to ms */
 
 	/* Điều chỉnh dựa trên latency so với mục tiêu */
 	if (avg_latency_ms > cd->target_latency_ms * 2) {
-		/* Latency quá cao: giảm batch, giảm thời gian chờ ghi */
-		cd->read_batch = max(cd->read_batch / 2, 6);  /* eMMC: keep reasonable minimum */
-		cd->write_batch = max(cd->write_batch / 2, 6);  /* eMMC: keep reasonable minimum */
+		cd->read_batch = max(cd->read_batch / 2, 6);
+		cd->write_batch = max(cd->write_batch / 2, 6);
 		cd->write_expire_ms = max(cd->write_expire_ms / 2, 10);
 		cd->pressure_thres = max(cd->pressure_thres / 2, 8);
 	} else if (avg_latency_ms < cd->target_latency_ms / 2) {
-		/* Latency rất thấp: tăng batch vừa phải cho eMMC (don't go too high to avoid small request delays) */
-		cd->read_batch = min(cd->read_batch * 2, 32);  /* eMMC maximum: 32 */
-		cd->write_batch = min(cd->write_batch * 2, 32);  /* eMMC maximum: 32 */
+		cd->read_batch = min(cd->read_batch * 2, 32);
+		cd->write_batch = min(cd->write_batch * 2, 32);
 		cd->write_expire_ms = min(cd->write_expire_ms * 2, 500);
 		cd->pressure_thres = min(cd->pressure_thres * 2, 48);
 	}
 
-	/* Điều chỉnh thêm dựa trên tỉ lệ đọc/ghi: nếu đọc nhiều hơn, tăng read_batch */
+	/* Điều chỉnh thêm dựa trên tỉ lệ đọc/ghi */
 	if (read_ratio > 70) {
-		cd->read_batch = min(cd->read_batch * 2, 32);  /* eMMC: cap at 32 */
+		cd->read_batch = min(cd->read_batch * 2, 32);
 	} else if (read_ratio < 30) {
-		cd->write_batch = min(cd->write_batch * 2, 32);  /* eMMC: cap at 32 */
+		cd->write_batch = min(cd->write_batch * 2, 32);
 	}
 
-	/* Điều chỉnh dựa trên độ sâu hàng đợi: nếu hàng đợi dài, giảm batch để tránh tụt hậu */
+	/* Điều chỉnh dựa trên độ sâu hàng đợi */
 	if (queue_depth > cd->pressure_thres * 2) {
-		cd->read_batch = max(cd->read_batch / 2, 6);  /* eMMC: keep minimum 6 */
-		cd->write_batch = max(cd->write_batch / 2, 6);  /* eMMC: keep minimum 6 */
+		cd->read_batch = max(cd->read_batch / 2, 6);
+		cd->write_batch = max(cd->write_batch / 2, 6);
 	}
 
 	/* Lưu lại giá trị hiện tại để phục hồi khi idle */
 	cd->saved_read_batch = cd->read_batch;
 	cd->saved_write_batch = cd->write_batch;
 	cd->saved_write_expire_ms = cd->write_expire_ms;
+
+	/* Clamp if eMMC */
+	cinnamon_clamp_for_emmc(cd);
 }
 
 static int cinnamon_dispatch(struct request_queue *q, int force)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 	struct request *rq = NULL;
-	unsigned long now = jiffies;
+	u64 now_ns = ktime_to_ns(ktime_get());
 	int target_pressure = 0;
 	int pressure = atomic_read(&cinnamon_io_pressure);
-	unsigned long write_expire = msecs_to_jiffies(cd->write_expire_ms);
+	unsigned long write_expire_ns = cd->write_expire_ms * 1000000ULL;
 	unsigned long read_batch = cd->read_batch;
 	int dispatch_count = 0;
 
+	/* --- Starvation recovery check --- */
+	if (cd->starvation_recovery_until && time_after(jiffies, cd->starvation_recovery_until)) {
+		cd->read_batch = cd->saved_read_batch_for_starve;
+		cd->starvation_recovery_until = 0;
+		cinnamon_clamp_for_emmc(cd);
+	}
+
 	/* Optimize: Cache expensive calculations based on pressure */
 	if (unlikely(pressure == 3)) {
-		write_expire = msecs_to_jiffies(50); /* Tighten for congestion */
+		write_expire_ns = 50 * 1000000ULL; /* Tighten for congestion */
 		read_batch = 32; /* Larger batch for boot/loading throughput */
 	} else if (pressure <= 1) {
-		write_expire = msecs_to_jiffies(250); /* Relax for read priority */
+		write_expire_ns = 250 * 1000000ULL; /* Relax for read priority */
+	}
+
+	/* Adaptive write_expire based on queue depth */
+	if (cd->write_cnt + cd->read_cnt > 32) {
+		write_expire_ns = 80 * 1000000ULL; /* Faster expire when queue is very full */
+	} else if (cd->write_cnt > 16) {
+		write_expire_ns = 150 * 1000000ULL; /* Moderate expire when write-heavy */
+	}
+
+	/* --- TRIM queue absolute priority --- */
+	if (!list_empty(&cd->trim_queue)) {
+		rq = list_first_entry(&cd->trim_queue, struct request, queuelist);
+		target_pressure = 0; /* TRIM doesn't affect pressure */
+		dispatch_count = 1;
+		goto dispatch_trim;
 	}
 
 	/* Fast path: Check write starvation first (most critical) */
 	if (!list_empty(&cd->write_queue)) {
 		struct request *wrq = list_first_entry(&cd->write_queue, struct request, queuelist);
-		unsigned long fifo_time = (unsigned long)(uintptr_t)wrq->elv.priv[0];
+		u64 req_time = get_req_time(wrq);
+		u64 wait_time = now_ns - req_time;
 
-		if (time_after(now, fifo_time + write_expire)) {
+		if (wait_time > write_expire_ns) {
+			/* Starvation detected */
+			if (wait_time > WRITE_STARVE_THRESH_NS) {
+				/* Severe starvation >300ms */
+				cd->write_starved_count++;
+				cd->last_starved_jiffies = jiffies;
+				if (!cd->starvation_recovery_until) {
+					cd->saved_read_batch_for_starve = cd->read_batch;
+					cd->read_batch = 4;
+					cinnamon_clamp_for_emmc(cd);
+					cd->starvation_recovery_until = jiffies + 2 * HZ;
+				}
+			}
 			rq = wrq;
 			target_pressure = 3; /* CONGESTED */
 			dispatch_count = 1;
 			goto dispatch_write;
+		}
+	}
+
+	/* Priority for sync writes: if any sync write in queue, dispatch it immediately */
+	if (!list_empty(&cd->write_queue)) {
+		struct request *wrq;
+		list_for_each_entry(wrq, &cd->write_queue, queuelist) {
+			if (wrq->cmd_flags & REQ_SYNC) {
+				rq = wrq;
+				target_pressure = 2; /* WRITE BATCH (but expedited) */
+				dispatch_count = 1;
+				goto dispatch_write;
+			}
 		}
 	}
 
@@ -467,20 +631,18 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 		}
 	}
 
-	/* No requests to dispatch - optimize expensive operations */
+	/* No requests to dispatch */
 	{
-		/* Optimize: Only call expensive functions every N dispatches or when needed */
-		static int call_counter = 0;
-		call_counter++;
+		cd->empty_dispatch_count++;
 
 		cinnamon_set_pressure(cd, q, 0);
 
-		/* Only adjust params every 100 empty dispatches (~2-5 seconds at high IOPS) */
-		if ((call_counter % 100) == 0)
+		/* Only adjust params every 100 empty dispatches */
+		if ((cd->empty_dispatch_count % 100) == 0)
 			cinnamon_adjust_params(cd, q);
 		
 		/* Only update read-ahead every 50 empty dispatches */
-		if ((call_counter % 50) == 0) {
+		if ((cd->empty_dispatch_count % 50) == 0) {
 			if (cd->predicted_sector != 0 && cd->read_cnt == 0 && list_empty(&cd->read_queue)) {
 				unsigned long current_ra = q->backing_dev_info.ra_pages;
 				unsigned long max_ra = min(current_ra * 2, 256UL);
@@ -495,22 +657,34 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	}
 	return 0;
 
+dispatch_trim:
+	if (rq) {
+		if (cd->trim_cnt > 0)
+			cd->trim_cnt--;
+		list_del_init(&rq->queuelist);
+		/* No latency tracking for TRIM (optional) */
+		set_req_time(rq, 0);
+		elv_dispatch_sort(q, rq);
+		return 1;
+	}
+	return 0;
+
 dispatch_read:
 	if (rq) {
 		if (cd->read_cnt > 0)
 			cd->read_cnt--;
 		list_del_init(&rq->queuelist);
 
-		/* Optimize: Simplified latency tracking - only update every 8 dispatches */
+		/* Latency tracking with ns */
 		if ((dispatch_count % 8) == 0) {
-			u64 current_latency = jiffies - (unsigned long)(uintptr_t)rq->elv.priv[0];
-			u64 old_avg = atomic64_read(&cd->total_latency);
+			u64 current_latency = now_ns - get_req_time(rq);
+			u64 old_avg = atomic64_read(&cd->total_latency_ns);
 			int old_count = atomic_read(&cd->num_requests);
 			
 			if (old_count > 0) {
-				atomic64_set(&cd->total_latency, (old_avg * 7 + current_latency * 3) / 10);
+				atomic64_set(&cd->total_latency_ns, (old_avg * 7 + current_latency * 3) / 10);
 			} else {
-				atomic64_set(&cd->total_latency, current_latency);
+				atomic64_set(&cd->total_latency_ns, current_latency);
 			}
 			
 			if (old_count < 100)
@@ -519,19 +693,18 @@ dispatch_read:
 				atomic_set(&cd->num_requests, old_count / 2);
 		}
 
-		/* Optimize: Only update read history every 4 read dispatches */
+		/* Update read history periodically */
 		if ((cd->dispatch_seq++ % 4) == 0)
 			cinnamon_update_read_history(cd, blk_rq_pos(rq));
 
-		rq->elv.priv[0] = NULL;
+		set_req_time(rq, 0);
 		cd->batch_count = 0;
 
-		/* Optimize: Cache interactive check result */
+		/* Interactive boost */
 		if (is_interactive_process(cd, rq)) {
-			target_pressure = 1; /* READ URGENT */
+			target_pressure = 1;
 		}
 
-		/* Optimize: Only call set_pressure when pressure actually changes */
 		if (target_pressure != atomic_read(&cinnamon_io_pressure))
 			cinnamon_set_pressure(cd, q, target_pressure);
 
@@ -546,16 +719,16 @@ dispatch_write:
 			cd->write_cnt--;
 		list_del_init(&rq->queuelist);
 
-		/* Optimize: Simplified latency tracking for writes */
-		if ((dispatch_count % 16) == 0) { /* Less frequent for writes */
-			u64 current_latency = jiffies - (unsigned long)(uintptr_t)rq->elv.priv[0];
-			u64 old_avg = atomic64_read(&cd->total_latency);
+		/* Latency tracking for writes */
+		if ((dispatch_count % 16) == 0) {
+			u64 current_latency = now_ns - get_req_time(rq);
+			u64 old_avg = atomic64_read(&cd->total_latency_ns);
 			int old_count = atomic_read(&cd->num_requests);
 			
 			if (old_count > 0) {
-				atomic64_set(&cd->total_latency, (old_avg * 7 + current_latency * 3) / 10);
+				atomic64_set(&cd->total_latency_ns, (old_avg * 7 + current_latency * 3) / 10);
 			} else {
-				atomic64_set(&cd->total_latency, current_latency);
+				atomic64_set(&cd->total_latency_ns, current_latency);
 			}
 			
 			if (old_count < 100)
@@ -564,10 +737,22 @@ dispatch_write:
 				atomic_set(&cd->num_requests, old_count / 2);
 		}
 
-		rq->elv.priv[0] = NULL;
+		/* Update write history periodically */
+		if ((cd->dispatch_seq++ % 4) == 0)
+			cinnamon_update_write_history(cd, blk_rq_pos(rq));
+
+		set_req_time(rq, 0);
 		cd->read_batch_count = 0;
 
-		/* Optimize: Inline queue depth check instead of always calling set_pressure */
+		/* Boost batch if sequential write predicted */
+		if (cd->predicted_write_sector != 0 && cd->last_write_direction != 0) {
+			/* Allow larger batch for this dispatch */
+			cd->batch_count = 0; /* Reset to allow more writes? Actually we just let it continue */
+			/* No change needed, but we could temporarily increase write_batch */
+			/* For simplicity, we just note the prediction and rely on existing batch */
+		}
+
+		/* Pressure check */
 		if ((cd->write_cnt + cd->read_cnt) > cd->pressure_thres) {
 			if (atomic_read(&cinnamon_io_pressure) != 3)
 				cinnamon_set_pressure(cd, q, 3);
@@ -585,14 +770,25 @@ static void cinnamon_add_request(struct request_queue *q, struct request *rq)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 
-	if (rq_data_dir(rq) == READ) {
-		rq->elv.priv[0] = (void *)(uintptr_t)jiffies;
-		list_add_tail(&rq->queuelist, &cd->read_queue);
+	set_req_time(rq, ktime_to_ns(ktime_get()));
+
+	if (rq->cmd_flags & REQ_DISCARD) {
+		/* TRIM requests go to dedicated queue */
+		list_add_tail(&rq->queuelist, &cd->trim_queue);
+		cd->trim_cnt++;
+	} else if (rq_data_dir(rq) == READ) {
+		/* Sync reads go to front */
+		if (rq->cmd_flags & REQ_SYNC)
+			list_add(&rq->queuelist, &cd->read_queue);
+		else
+			list_add_tail(&rq->queuelist, &cd->read_queue);
 		cd->read_cnt++;
 	} else {
-		/* ZERO-ALLOC TRICK: Lưu jiffies trực tiếp vào con trỏ */
-		rq->elv.priv[0] = (void *)(uintptr_t)jiffies;
-		list_add_tail(&rq->queuelist, &cd->write_queue);
+		/* Sync writes go to front */
+		if (rq->cmd_flags & REQ_SYNC)
+			list_add(&rq->queuelist, &cd->write_queue);
+		else
+			list_add_tail(&rq->queuelist, &cd->write_queue);
 		cd->write_cnt++;
 	}
 }
@@ -603,7 +799,8 @@ cinnamon_former_request(struct request_queue *q, struct request *rq)
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 
 	if (rq->queuelist.prev == &cd->read_queue ||
-	    rq->queuelist.prev == &cd->write_queue)
+	    rq->queuelist.prev == &cd->write_queue ||
+	    rq->queuelist.prev == &cd->trim_queue)
 		return NULL;
 	return list_entry(rq->queuelist.prev, struct request, queuelist);
 }
@@ -614,12 +811,12 @@ cinnamon_latter_request(struct request_queue *q, struct request *rq)
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 
 	if (rq->queuelist.next == &cd->read_queue ||
-	    rq->queuelist.next == &cd->write_queue)
+	    rq->queuelist.next == &cd->write_queue ||
+	    rq->queuelist.next == &cd->trim_queue)
 		return NULL;
 	return list_entry(rq->queuelist.next, struct request, queuelist);
 }
 
-/* Tương thích với kernel 3.10+ (trả về int hoặc void*) */
 static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 {
 	struct cinnamon_data *cd;
@@ -637,25 +834,32 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 
 	INIT_LIST_HEAD(&cd->read_queue);
 	INIT_LIST_HEAD(&cd->write_queue);
+	INIT_LIST_HEAD(&cd->trim_queue);
 	cd->batch_count = 0;
 	cd->write_cnt = 0;
 	cd->read_cnt = 0;
+	cd->trim_cnt = 0;
 	cd->read_batch_count = 0;
-	atomic64_set(&cd->total_latency, 0);
+	atomic64_set(&cd->total_latency_ns, 0);
 	atomic_set(&cd->num_requests, 0);
 	cd->last_ra_pressure = -1;
 	cd->last_pressure_change_jiffies = 0;
-	/* Set default tunable values */
 	cd->write_expire_ms = CINNAMON_WRITE_EXPIRE;
 	cd->read_batch = CINNAMON_READ_BATCH;
 	cd->write_batch = CINNAMON_WRITE_BATCH;
 	cd->pressure_thres = CINNAMON_PRESSURE_THRES;
 	cd->hysteresis_ms = CINNAMON_HYSTERESIS_MS;
-	/* Initialize read prediction history */
+	/* Read prediction */
 	cd->history_index = 0;
 	cd->history_count = 0;
 	cd->last_read_direction = 0;
 	cd->predicted_sector = 0;
+	/* Write prediction */
+	cd->write_history_index = 0;
+	cd->write_history_count = 0;
+	cd->last_write_direction = 0;
+	cd->predicted_write_sector = 0;
+	/* Adaptive */
 	cd->last_adjust_jiffies = jiffies;
 	cd->target_latency_ms = CINNAMON_TARGET_LATENCY_MS;
 	cd->adjust_interval_ms = CINNAMON_ADJUST_INTERVAL_MS;
@@ -664,10 +868,28 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 	cd->saved_write_expire_ms = cd->write_expire_ms;
 	cd->last_interactive_pid = 0;
 	cd->interactive_expire = 0;
-	cd->last_manual_param_change_jiffies = jiffies; /* Initialize to avoid conflicts */
+	cd->last_manual_param_change_jiffies = jiffies;
 	cd->q = q;
-	cd->dispatch_seq = 0; /* Initialize dispatch sequence counter */
-	
+	cd->dispatch_seq = 0;
+	cd->empty_dispatch_count = 0;
+
+	/* --- Starvation fields init --- */
+	cd->write_starved_count = 0;
+	cd->last_starved_jiffies = 0;
+	cd->starvation_recovery_until = 0;
+	cd->saved_read_batch_for_starve = 0;
+
+	/* Detect eMMC based on backing device's device major */
+	cd->emmc_mode = false;
+	if (q->backing_dev_info.dev) {
+		dev_t devt = q->backing_dev_info.dev->devt;
+		if (MAJOR(devt) == EMMC_MAJOR)
+			cd->emmc_mode = true;
+	}
+
+	/* Clamp initial values if eMMC */
+	cinnamon_clamp_for_emmc(cd);
+
 	eq->elevator_data = cd;
 
 	spin_lock_irq(q->queue_lock);
@@ -680,33 +902,31 @@ static void cinnamon_exit_queue(struct elevator_queue *e)
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	
-	/* Không cần giải phóng request wrapper vì ta không alloc! */
 	WARN_ON(!list_empty(&cd->read_queue));
 	WARN_ON(!list_empty(&cd->write_queue));
+	WARN_ON(!list_empty(&cd->trim_queue));
 
 	kfree(cd);
 }
+
+/* Sysfs attributes */
 
 static ssize_t cinnamon_pressure_show(struct elevator_queue *e, char *page)
 {
 	return sprintf(page, "%d\n", atomic_read(&cinnamon_io_pressure));
 }
 
-static ssize_t cinnamon_avg_latency_show(struct elevator_queue *e, char *page)
+static ssize_t cinnamon_avg_latency_ns_show(struct elevator_queue *e, char *page)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	u64 total;
+	u64 total_ns;
 	int num;
 
-	total = atomic64_read(&cd->total_latency);
+	total_ns = atomic64_read(&cd->total_latency_ns);
 	num = atomic_read(&cd->num_requests);
-	if (num == 0) return sprintf(page, "0\n");
-	{
-		u64 avg_jiffies = total / num;
-		u64 msecs = (avg_jiffies * 1000ULL) / HZ;
-		return sprintf(page, "%llu\n", (unsigned long long)msecs);
-	}
-	return 0;
+	if (num == 0)
+		return sprintf(page, "0\n");
+	return sprintf(page, "%llu\n", (unsigned long long)div64_u64(total_ns, num));
 }
 
 static ssize_t cinnamon_write_expire_ms_show(struct elevator_queue *e, char *page)
@@ -721,6 +941,7 @@ static ssize_t cinnamon_write_expire_ms_store(struct elevator_queue *e, const ch
 	long val = simple_strtol(page, NULL, 10);
 	if (val > 0) {
 		cd->write_expire_ms = val;
+		cd->last_manual_param_change_jiffies = jiffies;
 		return count;
 	}
 	return -EINVAL;
@@ -738,6 +959,8 @@ static ssize_t cinnamon_read_batch_store(struct elevator_queue *e, const char *p
 	long val = simple_strtol(page, NULL, 10);
 	if (val > 0) {
 		cd->read_batch = val;
+		cinnamon_clamp_for_emmc(cd);
+		cd->last_manual_param_change_jiffies = jiffies;
 		return count;
 	}
 	return -EINVAL;
@@ -755,6 +978,8 @@ static ssize_t cinnamon_write_batch_store(struct elevator_queue *e, const char *
 	long val = simple_strtol(page, NULL, 10);
 	if (val > 0) {
 		cd->write_batch = val;
+		cinnamon_clamp_for_emmc(cd);
+		cd->last_manual_param_change_jiffies = jiffies;
 		return count;
 	}
 	return -EINVAL;
@@ -772,6 +997,8 @@ static ssize_t cinnamon_pressure_thres_store(struct elevator_queue *e, const cha
 	long val = simple_strtol(page, NULL, 10);
 	if (val >= 0) {
 		cd->pressure_thres = val;
+		cinnamon_clamp_for_emmc(cd);
+		cd->last_manual_param_change_jiffies = jiffies;
 		return count;
 	}
 	return -EINVAL;
@@ -789,6 +1016,7 @@ static ssize_t cinnamon_hysteresis_ms_store(struct elevator_queue *e, const char
 	long val = simple_strtol(page, NULL, 10);
 	if (val > 0) {
 		cd->hysteresis_ms = val;
+		cd->last_manual_param_change_jiffies = jiffies;
 		return count;
 	}
 	return -EINVAL;
@@ -806,6 +1034,7 @@ static ssize_t cinnamon_target_latency_ms_store(struct elevator_queue *e, const 
 	long val = simple_strtol(page, NULL, 10);
 	if (val > 0) {
 		cd->target_latency_ms = val;
+		cd->last_manual_param_change_jiffies = jiffies;
 		return count;
 	}
 	return -EINVAL;
@@ -821,8 +1050,9 @@ static ssize_t cinnamon_adjust_interval_ms_store(struct elevator_queue *e, const
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val = simple_strtol(page, NULL, 10);
-	if (val >= 100) { /* tối thiểu 100ms */
+	if (val >= 100) {
 		cd->adjust_interval_ms = val;
+		cd->last_manual_param_change_jiffies = jiffies;
 		return count;
 	}
 	return -EINVAL;
@@ -855,13 +1085,54 @@ static ssize_t cinnamon_ra_pages_show(struct elevator_queue *e, char *page)
 static ssize_t cinnamon_batch_stats_show(struct elevator_queue *e, char *page)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	return sprintf(page, "read_batch_count: %u\nbatch_count: %u\nread_cnt: %d\nwrite_cnt: %d\n",
-		       cd->read_batch_count, cd->batch_count, cd->read_cnt, cd->write_cnt);
+	return sprintf(page, "read_batch_count: %u\nbatch_count: %u\nread_cnt: %d\nwrite_cnt: %d\ntrim_cnt: %d\n",
+		       cd->read_batch_count, cd->batch_count, cd->read_cnt, cd->write_cnt, cd->trim_cnt);
+}
+
+static ssize_t cinnamon_emmc_mode_show(struct elevator_queue *e, char *page)
+{
+	struct cinnamon_data *cd = e->elevator_data;
+	return sprintf(page, "%d\n", cd->emmc_mode ? 1 : 0);
+}
+
+static ssize_t cinnamon_emmc_mode_store(struct elevator_queue *e, const char *page, size_t count)
+{
+	struct cinnamon_data *cd = e->elevator_data;
+	long val = simple_strtol(page, NULL, 10);
+	bool new_mode = (val != 0);
+
+	if (cd->emmc_mode != new_mode) {
+		cd->emmc_mode = new_mode;
+		/* Re-clamp current values */
+		cinnamon_clamp_for_emmc(cd);
+		cd->last_manual_param_change_jiffies = jiffies;
+	}
+	return count;
+}
+
+/* sysfs entry for trim count */
+static ssize_t cinnamon_trim_cnt_show(struct elevator_queue *e, char *page)
+{
+	struct cinnamon_data *cd = e->elevator_data;
+	return sprintf(page, "%d\n", cd->trim_cnt);
+}
+
+/* --- Starvation sysfs entries --- */
+static ssize_t cinnamon_starvation_count_show(struct elevator_queue *e, char *page)
+{
+	struct cinnamon_data *cd = e->elevator_data;
+	return sprintf(page, "%u\n", cd->write_starved_count);
+}
+
+static ssize_t cinnamon_last_starved_show(struct elevator_queue *e, char *page)
+{
+	struct cinnamon_data *cd = e->elevator_data;
+	return sprintf(page, "%lu\n", cd->last_starved_jiffies);
 }
 
 static struct elv_fs_entry cinnamon_attrs[] = {
 	__ATTR(pressure, 0444, cinnamon_pressure_show, NULL),
-	__ATTR(avg_latency, 0444, cinnamon_avg_latency_show, NULL),
+	__ATTR(avg_latency_ns, 0444, cinnamon_avg_latency_ns_show, NULL),
 	__ATTR(write_expire_ms, 0644, cinnamon_write_expire_ms_show, cinnamon_write_expire_ms_store),
 	__ATTR(read_batch, 0644, cinnamon_read_batch_show, cinnamon_read_batch_store),
 	__ATTR(write_batch, 0644, cinnamon_write_batch_show, cinnamon_write_batch_store),
@@ -874,6 +1145,11 @@ static struct elv_fs_entry cinnamon_attrs[] = {
 	__ATTR(history_count, 0444, cinnamon_history_count_show, NULL),
 	__ATTR(ra_pages, 0444, cinnamon_ra_pages_show, NULL),
 	__ATTR(batch_stats, 0444, cinnamon_batch_stats_show, NULL),
+	__ATTR(emmc_mode, 0644, cinnamon_emmc_mode_show, cinnamon_emmc_mode_store),
+	__ATTR(trim_cnt, 0444, cinnamon_trim_cnt_show, NULL),
+	/* Starvation attributes */
+	__ATTR(starvation_count, 0444, cinnamon_starvation_count_show, NULL),
+	__ATTR(last_starved, 0444, cinnamon_last_starved_show, NULL),
 	__ATTR_NULL
 };
 
@@ -895,7 +1171,6 @@ static struct elevator_type elevator_cinnamon = {
 
 static int __init cinnamon_init(void)
 {
-	/* Không cần tạo slab cache nữa - Zero Alloc! */
 	return elv_register(&elevator_cinnamon);
 }
 
