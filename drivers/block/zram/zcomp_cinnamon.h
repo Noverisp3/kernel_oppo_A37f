@@ -7,23 +7,22 @@
 
 #include <linux/types.h>
 #include <linux/atomic.h>
+#include <linux/spinlock.h>
 
-#define CINNAMON_BLOCK_SIZE 32
-#define SIG_THRESHOLD 32   /* số bit khác nhau tối đa để tiếp tục kiểm tra delta */
+/* Maximum block size we support (must fit in prev_blocks) */
+#define MAX_BLOCK_SIZE 64
 
-/* Cấu trúc Context cho mỗi luồng nén */
+/* Signature threshold: max differing bits to consider delta */
+#define SIG_THRESHOLD 32
+
+/* Context structure for each compression thread */
 struct cinnamon_ctx {
-    u64 prev_blocks[4][CINNAMON_BLOCK_SIZE / sizeof(u64)];
-    u64 prev_sig[4];        /* signature của 4 block trước */
-    int prev_index;
+	u8 prev_blocks[4][MAX_BLOCK_SIZE];   /* previous blocks as byte arrays */
+	u64 prev_sig[4];                      /* 64‑bit signatures of previous blocks */
+	int prev_index;                        /* ring buffer index (0..3) */
 };
 
-/* * Khai báo biến áp lực I/O từ I/O Scheduler.
- * Dùng extern atomic_t để đảm bảo tính an toàn khi truy cập đa nhân (Symmetric Multiprocessing)
- */
-extern atomic_t cinnamon_io_pressure;
-
-/* Compression statistics */
+/* Compression statistics (exported for proc) */
 extern atomic_t cinnamon_pages_compressed;
 extern atomic_t cinnamon_zero_blocks;
 extern atomic_t cinnamon_match_blocks;
@@ -38,7 +37,7 @@ extern atomic64_t cinnamon_bytes_out;
 extern void cinnamon_proc_init(void);
 extern void cinnamon_proc_exit(void);
 
-/* Khai báo backend để zRAM có thể nhận diện */
+/* Backend structure for zram */
 extern struct zcomp_backend zcomp_cinnamon;
 
 #endif /* _ZCOMP_CINNAMON_H_ */

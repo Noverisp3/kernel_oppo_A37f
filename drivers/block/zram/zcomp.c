@@ -83,7 +83,7 @@ static struct zcomp_strm *zcomp_strm_alloc(struct zcomp *comp)
 	if (!zstrm)
 		return NULL;
 
-	zstrm->private = comp->backend->create();
+	zstrm->private = comp->backend->create(comp->dev_private);  /* truyền dev_private */
 	/*
 	 * allocate 2 pages. 1 for compressed data, plus 1 extra for the
 	 * case when compressed size is larger than the original one
@@ -314,12 +314,14 @@ int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
 int zcomp_decompress(struct zcomp *comp, const unsigned char *src,
 		size_t src_len, unsigned char *dst)
 {
-	return comp->backend->decompress(src, src_len, dst);
+	return comp->backend->decompress(src, src_len, dst, comp->dev_private);
 }
 
 void zcomp_destroy(struct zcomp *comp)
 {
 	comp->destroy(comp);
+	if (comp->backend->dev_destroy && comp->dev_private)
+		comp->backend->dev_destroy(comp->dev_private);
 	kfree(comp);
 }
 
@@ -344,11 +346,26 @@ struct zcomp *zcomp_create(const char *compress, int max_strm)
 		return ERR_PTR(-ENOMEM);
 
 	comp->backend = backend;
+
+	/* Tạo ngữ cảnh thiết bị nếu backend hỗ trợ */
+	if (backend->dev_create) {
+		comp->dev_private = backend->dev_create();
+		if (!comp->dev_private) {
+			kfree(comp);
+			return ERR_PTR(-ENOMEM);
+		}
+	} else {
+		comp->dev_private = NULL;
+	}
+
 	if (max_strm > 1)
 		zcomp_strm_multi_create(comp, max_strm);
 	else
 		zcomp_strm_single_create(comp);
+
 	if (!comp->stream) {
+		if (backend->dev_destroy && comp->dev_private)
+			backend->dev_destroy(comp->dev_private);
 		kfree(comp);
 		return ERR_PTR(-ENOMEM);
 	}

@@ -13,7 +13,7 @@
 
 #include "zcomp_lzo.h"
 
-static void *lzo_create(void)
+static void *lzo_create(void *dev_private)
 {
 	return kzalloc(LZO1X_MEM_COMPRESS, GFP_KERNEL);
 }
@@ -31,7 +31,7 @@ static int lzo_compress(const unsigned char *src, unsigned char *dst,
 }
 
 static int lzo_decompress(const unsigned char *src, size_t src_len,
-		unsigned char *dst)
+		unsigned char *dst, void *dev_private)
 {
 	size_t dst_len = PAGE_SIZE;
 	int ret = lzo1x_decompress_safe(src, src_len, dst, &dst_len);
@@ -43,5 +43,7 @@ struct zcomp_backend zcomp_lzo = {
 	.decompress = lzo_decompress,
 	.create = lzo_create,
 	.destroy = lzo_destroy,
+	.dev_create = NULL,
+	.dev_destroy = NULL,
 	.name = "lzo",
 };

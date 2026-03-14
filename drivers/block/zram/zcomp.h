@@ -31,10 +31,13 @@ struct zcomp_backend {
 			size_t *dst_len, void *private);
 
 	int (*decompress)(const unsigned char *src, size_t src_len,
-			unsigned char *dst);
+			unsigned char *dst, void *dev_private);  /* thêm dev_private */
 
-	void *(*create)(void);
+	void *(*create)(void *dev_private);    /* thêm tham số dev_private */
 	void (*destroy)(void *private);
+
+	void *(*dev_create)(void);              /* tạo ngữ cảnh thiết bị */
+	void (*dev_destroy)(void *dev_private);
 
 	const char *name;
 };
@@ -43,6 +46,7 @@ struct zcomp_backend {
 struct zcomp {
 	void *stream;
 	struct zcomp_backend *backend;
+	void *dev_private;                       /* ngữ cảnh thiết bị (dùng chung) */
 
 	struct zcomp_strm *(*strm_find)(struct zcomp *comp);
 	void (*strm_release)(struct zcomp *comp, struct zcomp_strm *zstrm);
