@@ -17,7 +17,7 @@
 
 /* Context structure for each compression thread */
 struct cinnamon_ctx {
-	u8 prev_blocks[4][MAX_BLOCK_SIZE];   /* previous blocks as byte arrays */
+	u8 prev_blocks[4][MAX_BLOCK_SIZE] __aligned(16); /* căn chỉnh 16 byte cho NEON */
 	u64 prev_sig[4];                      /* 64‑bit signatures of previous blocks */
 	int prev_index;                        /* ring buffer index (0..3) */
 };
