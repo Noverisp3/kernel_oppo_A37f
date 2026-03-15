@@ -704,6 +704,10 @@ KBUILD_CPPFLAGS += $(KCPPFLAGS)
 KBUILD_AFLAGS += $(KAFLAGS)
 KBUILD_CFLAGS += $(KCFLAGS)
 
+# LTO optimization flags for GCC 4.9
+KBUILD_CFLAGS += -flto=jobserver -fuse-linker-plugin -ffat-lto-objects
+KBUILD_LDFLAGS += -flto=jobserver -fuse-linker-plugin
+
 # Use --build-id when available.
 LDFLAGS_BUILD_ID = $(patsubst -Wl$(comma)%,%,\
 			      $(call cc-ldoption, -Wl$(comma)--build-id,))

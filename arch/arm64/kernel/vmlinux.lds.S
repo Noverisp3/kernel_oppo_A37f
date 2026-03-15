@@ -52,6 +52,7 @@ SECTIONS
 		EXIT_CALL
 		*(.discard)
 		*(.discard.*)
+		*(.gnu.lto_*)
 	}
 
 	. = PAGE_OFFSET + TEXT_OFFSET;
