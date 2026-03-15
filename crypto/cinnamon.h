@@ -1,5 +1,5 @@
 /*
- * crypto/cinnamon.h - Cinnamon Crypto Header (Final Version)
+ * crypto/cinnamon.h - Cinnamon Crypto Header
  */
 
 #ifndef _CRYPTO_CINNAMON_H

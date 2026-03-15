@@ -110,4 +110,4 @@ module_init(cinnamon_crypto_init);
 module_exit(cinnamon_crypto_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("CCrypto - Ultra Fast Checksum for MSM8916");
+MODULE_DESCRIPTION("CCrypto");
