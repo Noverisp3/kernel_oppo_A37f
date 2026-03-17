@@ -108,8 +108,8 @@ static int suspend_test(int level)
 {
 #ifdef CONFIG_PM_DEBUG
 	if (pm_test_level == level) {
-		printk(KERN_INFO "suspend debug: Waiting for 2 seconds.\n");
-		mdelay(2000); /* Cinnamon: Reduced from 5s to 2s for faster resume */
+		printk(KERN_INFO "suspend debug: Waiting for 5 seconds.\n");
+		mdelay(5000);
 		return 1;
 	}
 #endif /* !CONFIG_PM_DEBUG */
@@ -334,7 +334,7 @@ static int sys_sync_queue(void)
 		if (work_status & WORK_BUSY_RUNNING) {
 			while (wait_event_timeout(sys_sync_wait,
 					sys_sync_completed,
-					msecs_to_jiffies(50)) == 0) { 
+					msecs_to_jiffies(100)) == 0) { 
 				if (pm_wakeup_pending()) {
 					pr_info("PM: Pre-Syncing abort\n");
 					goto abort;
@@ -347,7 +347,7 @@ static int sys_sync_queue(void)
 	}
 
 	while (wait_event_timeout(sys_sync_wait, sys_sync_completed,
-			msecs_to_jiffies(50)) == 0) { 
+			msecs_to_jiffies(100)) == 0) { 
 		if (pm_wakeup_pending()) {
 			pr_info("PM: Syncing abort\n");
 			goto abort;

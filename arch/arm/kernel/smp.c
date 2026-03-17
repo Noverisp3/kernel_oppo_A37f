@@ -102,7 +102,7 @@ int __cpuinit __cpu_up(unsigned int cpu, struct task_struct *idle)
 		 * CPU was successfully started, wait for it
 		 * to come online.
 		 */
-		udelay(50); /* Reduced from 100 for faster online detection */
+		udelay(75); /* Reduced from 100 for faster online detection */
 		if (!cpu_up(cpu)) {
 			/*
 			 * CPU reported present but did not respond to

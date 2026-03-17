@@ -139,6 +139,12 @@ void kernel_neon_begin_partial(u32 num_regs)
 }
 EXPORT_SYMBOL(kernel_neon_begin_partial);
 
+void kernel_neon_begin(void)
+{
+	kernel_neon_begin_partial(32);
+}
+EXPORT_SYMBOL(kernel_neon_begin);
+
 void kernel_neon_end(void)
 {
 	if (in_interrupt()) {
