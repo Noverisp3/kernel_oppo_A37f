@@ -14,14 +14,9 @@
  * 10. Partial Match (16B): Encode when first half matches a previous block.
  * 11. Repeat‑Byte Run: Encode runs of identical bytes (any value) – useful for bitmaps.
  * 12. ARM64 NEON Fast Path: Accelerated zero check, block match, and diff counting using inline assembly.
- *
- * Additional optimizations:
- * - Align prev_blocks to 16 bytes for NEON.
- * - Reuse signatures in runs and matches.
- * - Search match in order of recency.
- * - Early break in delta loop when best_delta == 1.
- * - Prefetch during run detection.
- * - Use memset for history update in runs.
+ * 13. Batching NEON: Use kernel_neon_begin() once per page to reduce context‑switch overhead.
+ * 14. Branch prediction hint for raw mode in decompression.
+ * 15. Stride‑based Prediction: After a match at distance d, predict future matches at the same offset.
  *
  * Block size is tunable via module parameter `cinnamon_block_size` (default 32).
  * It must be a divisor of PAGE_SIZE (typically 16, 32, or 64).
@@ -193,7 +188,7 @@ static inline int find_first_diff_byte_generic(const u8 *b1, const u8 *b2, int b
 /* ========== NEON implementations (ARM64 only) ========== */
 #ifdef CONFIG_ARM64
 
-/* NEON version: check if a block is all zero (block size multiple of 16) */
+/* NEON version: check if a block is all zero (block size multiple of 16) – with begin/end */
 static inline int __attribute__((optimize("O0"))) neon_is_zero_block(const u8 *block, int block_size)
 {
 	int i;
@@ -220,7 +215,32 @@ static inline int __attribute__((optimize("O0"))) neon_is_zero_block(const u8 *b
 	return max_val == 0;
 }
 
-/* NEON version: exact match of two blocks (block size multiple of 16) */
+/* NEON batched version – assumes NEON context already active */
+static inline int __attribute__((optimize("O0"))) neon_is_zero_block_batched(const u8 *block, int block_size)
+{
+	int i;
+	uint8_t max_val;
+	/* No kernel_neon_begin/end here */
+	asm volatile(
+		"movi v0.16b, #0\n"
+		: : : "v0"
+	);
+	for (i = 0; i < block_size; i += 16) {
+		asm volatile(
+			"ld1 {v1.16b}, [%0]\n"
+			"orr v0.16b, v0.16b, v1.16b\n"
+			: : "r"(block + i) : "v1", "v0"
+		);
+	}
+	asm volatile(
+		"umaxv b2, v0.16b\n"
+		"umov %w0, v2.b[0]\n"
+		: "=r"(max_val) : : "v2"
+	);
+	return max_val == 0;
+}
+
+/* NEON version: exact match of two blocks – with begin/end */
 static inline int __attribute__((optimize("O0"))) neon_blocks_match(const u8 *b1, const u8 *b2, int block_size)
 {
 	int i;
@@ -247,7 +267,29 @@ static inline int __attribute__((optimize("O0"))) neon_blocks_match(const u8 *b1
 	return 1;
 }
 
-/* NEON version: count differing bytes between two blocks, early exit if >3 */
+/* NEON batched version – assumes NEON context active */
+static inline int __attribute__((optimize("O0"))) neon_blocks_match_batched(const u8 *b1, const u8 *b2, int block_size)
+{
+	int i;
+	uint8_t min_val;
+	for (i = 0; i < block_size; i += 16) {
+		asm volatile(
+			"ld1 {v0.16b}, [%1]\n"
+			"ld1 {v1.16b}, [%2]\n"
+			"cmeq v2.16b, v0.16b, v1.16b\n"
+			"uminv b3, v2.16b\n"
+			"umov %w0, v3.b[0]\n"
+			: "=r"(min_val)
+			: "r"(b1 + i), "r"(b2 + i)
+			: "v0", "v1", "v2", "v3"
+		);
+		if (min_val != 0xFF)
+			return 0;
+	}
+	return 1;
+}
+
+/* NEON version: count differing bytes – with begin/end */
 static inline int __attribute__((optimize("O0"))) neon_count_diff_bytes(const u8 *b1, const u8 *b2, int block_size)
 {
 	int i, total = 0;
@@ -278,7 +320,33 @@ static inline int __attribute__((optimize("O0"))) neon_count_diff_bytes(const u8
 	return total;
 }
 
-/* NEON: check if all bytes in a block equal the first byte */
+/* NEON batched version – assumes NEON context active */
+static inline int __attribute__((optimize("O0"))) neon_count_diff_bytes_batched(const u8 *b1, const u8 *b2, int block_size)
+{
+	int i, total = 0;
+	uint16_t sum;
+	for (i = 0; i < block_size; i += 16) {
+		asm volatile(
+			"ld1 {v0.16b}, [%1]\n"
+			"ld1 {v1.16b}, [%2]\n"
+			"eor v2.16b, v0.16b, v1.16b\n"
+			"cmeq v3.16b, v2.16b, #0\n"
+			"mvn v3.16b, v3.16b\n"
+			"ushr v3.16b, v3.16b, 7\n"
+			"uaddlv h4, v3.16b\n"
+			"umov %w0, v4.h[0]\n"
+			: "=r"(sum)
+			: "r"(b1 + i), "r"(b2 + i)
+			: "v0", "v1", "v2", "v3", "v4"
+		);
+		total += sum;
+		if (total > 3)
+			return total;
+	}
+	return total;
+}
+
+/* NEON: check if all bytes in a block equal the first byte – with begin/end */
 static inline int __attribute__((optimize("O0"))) neon_is_repeat_byte_block(const u8 *block, int block_size, u8 *value)
 {
 	int i;
@@ -313,7 +381,37 @@ static inline int __attribute__((optimize("O0"))) neon_is_repeat_byte_block(cons
 	return 1;
 }
 
-/* NEON: compute 64‑bit XOR signature (XOR of all 8‑byte words) */
+/* NEON batched version – assumes NEON context active */
+static inline int __attribute__((optimize("O0"))) neon_is_repeat_byte_block_batched(const u8 *block, int block_size, u8 *value)
+{
+	int i;
+	uint8_t first = block[0];
+	uint8_t all_equal;
+	*value = first;
+
+	asm volatile(
+		"dup v0.16b, %w0\n"
+		:
+		: "r"(first)
+		: "v0"
+	);
+	for (i = 0; i < block_size; i += 16) {
+		asm volatile(
+			"ld1 {v1.16b}, [%1]\n"
+			"cmeq v2.16b, v1.16b, v0.16b\n"
+			"uminv b3, v2.16b\n"
+			"umov %w0, v3.b[0]\n"
+			: "=r"(all_equal)
+			: "r"(block + i)
+			: "v1", "v2", "v3"
+		);
+		if (all_equal != 0xFF)
+			return 0;
+	}
+	return 1;
+}
+
+/* NEON: compute 64‑bit XOR signature – with begin/end */
 static inline u64 __attribute__((optimize("O0"))) neon_compute_block_signature(const u8 *block, int block_size)
 {
 	u64 sig_lo, sig_hi;
@@ -339,7 +437,31 @@ static inline u64 __attribute__((optimize("O0"))) neon_compute_block_signature(c
 	return sig_lo ^ sig_hi;
 }
 
-/* NEON: find first differing byte offset between two blocks */
+/* NEON batched version – assumes NEON context active */
+static inline u64 __attribute__((optimize("O0"))) neon_compute_block_signature_batched(const u8 *block, int block_size)
+{
+	u64 sig_lo, sig_hi;
+	const u8 *ptr = block;
+	int len = block_size;
+
+	asm volatile(
+		"movi v0.16b, #0\n"
+		"1:\n"
+		"subs %w[len], %w[len], #16\n"
+		"ld1 {v1.2d}, [%[ptr]], #16\n"
+		"eor v0.16b, v0.16b, v1.16b\n"
+		"b.gt 1b\n"
+		"umov %[sig_lo], v0.d[0]\n"
+		"umov %[sig_hi], v0.d[1]\n"
+		: [ptr] "+r"(ptr), [len] "+r"(len),
+		  [sig_lo] "=r"(sig_lo), [sig_hi] "=r"(sig_hi)
+		:
+		: "v0", "v1", "cc"
+	);
+	return sig_lo ^ sig_hi;
+}
+
+/* NEON: find first differing byte offset – with begin/end */
 static inline int __attribute__((optimize("O0"))) neon_find_first_diff_byte(const u8 *b1, const u8 *b2, int block_size)
 {
 	int i, j;
@@ -370,6 +492,33 @@ static inline int __attribute__((optimize("O0"))) neon_find_first_diff_byte(cons
 	}
 	kernel_neon_end();
 	return 0; /* all equal */
+}
+
+/* NEON batched version – assumes NEON context active */
+static inline int __attribute__((optimize("O0"))) neon_find_first_diff_byte_batched(const u8 *b1, const u8 *b2, int block_size)
+{
+	int i, j;
+	uint8_t cmp_result;
+	for (i = 0; i < block_size; i += 16) {
+		asm volatile(
+			"ld1 {v0.16b}, [%1]\n"
+			"ld1 {v1.16b}, [%2]\n"
+			"cmeq v2.16b, v0.16b, v1.16b\n"
+			"uminv b3, v2.16b\n"
+			"umov %w0, v3.b[0]\n"
+			: "=r"(cmp_result)
+			: "r"(b1 + i), "r"(b2 + i)
+			: "v0", "v1", "v2", "v3"
+		);
+		if (cmp_result != 0xFF) {
+			for (j = 0; j < 16; j++) {
+				if (b1[i + j] != b2[i + j])
+					return i + j;
+			}
+			break;
+		}
+	}
+	return 0;
 }
 
 /* Macro to check if NEON can be used safely for a given pointer */
@@ -482,17 +631,18 @@ static inline void find_three_diff_bytes(const u8 *b1, const u8 *b2, int block_s
 	}
 }
 
-/* ---- Main compression function ---- */
-static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
-                             size_t *dst_len, void *private)
+/* ---------- NEON‑batched compression routine ---------- */
+#ifdef CONFIG_ARM64
+static int cinnamon_compress_neon_batched(const unsigned char *src, unsigned char *dst,
+                                          size_t *dst_len, void *private,
+                                          int block_size, int blocks_per_page)
 {
+	/* C90: all declarations at the top */
 	int i;
 	unsigned char *header_ptr;
 	unsigned char *dst_data;
 	size_t out_len;
 	u64 final_checksum;
-	int block_size;
-	int blocks_per_page;
 	int header_size;
 	int half;
 	unsigned char mode;
@@ -510,25 +660,13 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 	u64 repeat_sig;
 	int order[4];
 	int idx;
-
-	int local_zero = 0, local_match = 0, local_delta = 0, local_raw = 0, local_partial = 0;
-
+	int local_zero, local_match, local_delta, local_raw, local_partial;
 	struct cinnamon_ctx *ctx = private;
-	u64 start_ns, end_ns, delta_ns;
-	cycles_t start_cycles, end_cycles, delta_cycles;
+	int stride_ref;
+	int d;
 
-	if (unlikely(!ctx))
-		return -EINVAL;
+	local_zero = local_match = local_delta = local_raw = local_partial = 0;
 
-	/* Use the tunable block size, ensuring it divides PAGE_SIZE */
-	block_size = cinnamon_block_size;
-	if (PAGE_SIZE % block_size != 0) {
-		block_size = 32;
-		if (PAGE_SIZE % block_size != 0)
-			block_size = 16;
-	}
-
-	blocks_per_page = PAGE_SIZE / block_size;
 	header_size = blocks_per_page / 2;
 
 	if (*dst_len < 1 + header_size + 8)
@@ -542,9 +680,7 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 	memset(header_ptr, 0, header_size);
 	memset(ctx->prev_blocks, 0, sizeof(ctx->prev_blocks));
 	ctx->prev_index = 0;
-
-	start_ns = sched_clock();
-	start_cycles = get_cycles();
+	ctx->pred_stride = 0;   /* initialize stride prediction */
 
 	i = 0;
 	while (i < blocks_per_page) {
@@ -553,14 +689,27 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 		if (i + 2 < blocks_per_page)
 			__builtin_prefetch(src + ((i + 2) * block_size), 0, 0);
 
-		/* --- Zero‑run detection (support long runs) --- */
-		if (likely(is_zero_block(current_src, block_size))) {
+		/* --- Stride‑based prediction --- */
+		if (ctx->pred_stride > 0 && i >= ctx->pred_stride) {
+			stride_ref = (ctx->prev_index + (4 - ctx->pred_stride)) % 4;
+			if (neon_blocks_match_batched(current_src,
+					(const u8 *)ctx->prev_blocks[stride_ref], block_size)) {
+				mode = CINNAMON_MODE_MATCH0 + stride_ref;
+				cur_sig = ctx->prev_sig[stride_ref];
+				local_match++;
+				goto set_mode;
+			} else {
+				ctx->pred_stride = 0;   /* prediction failed, reset */
+			}
+		}
+
+		/* --- Zero‑run detection --- */
+		if (likely(neon_is_zero_block_batched(current_src, block_size))) {
 			run = 1;
-			/* Find maximum run (up to 65535 blocks for long runs, but limited by page size) */
 			while (i + run < blocks_per_page && run < 65535) {
 				if (i + run + 1 < blocks_per_page)
 					__builtin_prefetch(src + ((i + run + 1) * block_size), 0, 0);
-				if (!is_zero_block(src + ((i + run) * block_size), block_size))
+				if (!neon_is_zero_block_batched(src + ((i + run) * block_size), block_size))
 					break;
 				run++;
 			}
@@ -587,24 +736,24 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 
 			local_zero += run;
 
-			/* Update history: all zero blocks -> signature = 0 */
 			for (p = 0; p < run; p++) {
 				memset(ctx->prev_blocks[ctx->prev_index], 0, block_size);
 				ctx->prev_sig[ctx->prev_index] = 0;
 				ctx->prev_index = (ctx->prev_index + 1) % 4;
 			}
 
+			ctx->pred_stride = 0;   /* run breaks stride pattern */
 			i += run;
 			continue;
 		}
 
 		/* --- Repeat‑byte run detection --- */
-		if (is_repeat_byte_block(current_src, block_size, &repeat_value)) {
+		if (neon_is_repeat_byte_block_batched(current_src, block_size, &repeat_value)) {
 			run = 1;
 			while (i + run < blocks_per_page && run < 255) {
 				if (i + run + 1 < blocks_per_page)
 					__builtin_prefetch(src + ((i + run + 1) * block_size), 0, 0);
-				if (!is_repeat_byte_block(src + ((i + run) * block_size), block_size, &next_val) ||
+				if (!neon_is_repeat_byte_block_batched(src + ((i + run) * block_size), block_size, &next_val) ||
 				    next_val != repeat_value)
 					break;
 				run++;
@@ -620,14 +769,14 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 			dst_data += 2;
 			out_len += 2;
 
-			/* Compute signature once for the first block (all blocks identical) */
-			repeat_sig = compute_block_signature(current_src, block_size);
+			repeat_sig = neon_compute_block_signature_batched(current_src, block_size);
 			for (p = 0; p < run; p++) {
 				memset(ctx->prev_blocks[ctx->prev_index], repeat_value, block_size);
 				ctx->prev_sig[ctx->prev_index] = repeat_sig;
 				ctx->prev_index = (ctx->prev_index + 1) % 4;
 			}
 
+			ctx->pred_stride = 0;   /* run breaks stride pattern */
 			i += run;
 			continue;
 		}
@@ -636,11 +785,13 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 
 		/* Quick match with previous block (i-1) */
 		if (i > 0) {
-			prev_ref = (ctx->prev_index + 3) & 3; /* most recent block */
-			if (blocks_match(current_src, (const u8 *)ctx->prev_blocks[prev_ref], block_size)) {
+			prev_ref = (ctx->prev_index + 3) & 3;
+			if (neon_blocks_match_batched(current_src,
+					(const u8 *)ctx->prev_blocks[prev_ref], block_size)) {
 				mode = CINNAMON_MODE_MATCH0 + prev_ref;
 				cur_sig = ctx->prev_sig[prev_ref];
 				local_match++;
+				ctx->pred_stride = 1;
 				goto set_mode;
 			}
 		}
@@ -652,10 +803,14 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 		order[3] = ctx->prev_index;
 		for (idx = 0; idx < 4; idx++) {
 			p = order[idx];
-			if (blocks_match(current_src, (const u8 *)ctx->prev_blocks[p], block_size)) {
+			if (neon_blocks_match_batched(current_src,
+					(const u8 *)ctx->prev_blocks[p], block_size)) {
 				mode = CINNAMON_MODE_MATCH0 + p;
 				cur_sig = ctx->prev_sig[p];
 				local_match++;
+				/* compute stride distance (1..4) */
+				d = ((ctx->prev_index + 3 - p) & 3) + 1;
+				ctx->pred_stride = d;
 				goto set_mode;
 			}
 		}
@@ -672,14 +827,15 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 				dst_data += 1 + half;
 				out_len += 1 + half;
 				local_partial++;
-				/* Need signature for history */
-				cur_sig = compute_block_signature(current_src, block_size);
+				cur_sig = neon_compute_block_signature_batched(current_src, block_size);
+				/* partial match does not set stride */
+				ctx->pred_stride = 0;
 				goto set_mode;
 			}
 		}
 
 		/* No match, compute signature for delta */
-		cur_sig = compute_block_signature(current_src, block_size);
+		cur_sig = neon_compute_block_signature_batched(current_src, block_size);
 
 		/* Try delta compression */
 		best_delta = 4;
@@ -689,12 +845,13 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 			if (__builtin_popcountll(xor_sig) > SIG_THRESHOLD)
 				continue;
 
-			diff = count_diff_bytes(current_src, (const u8 *)ctx->prev_blocks[p], block_size);
+			diff = neon_count_diff_bytes_batched(current_src,
+					(const u8 *)ctx->prev_blocks[p], block_size);
 			if (diff < best_delta) {
 				best_delta = diff;
 				best_ref = p;
 				if (best_delta == 0) break;
-				if (best_delta == 1) break; /* cannot be better */
+				if (best_delta == 1) break;
 			}
 		}
 		if (best_ref >= 0 && best_delta <= 3) {
@@ -702,8 +859,8 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 				if (unlikely(out_len + 3 > *dst_len - sizeof(u64)))
 					goto fallback_raw;
 				mode = CINNAMON_MODE_DELTA1;
-				off1 = find_first_diff_byte(current_src,
-				              (const u8 *)ctx->prev_blocks[best_ref], block_size);
+				off1 = neon_find_first_diff_byte_batched(current_src,
+						(const u8 *)ctx->prev_blocks[best_ref], block_size);
 				val1 = current_src[off1];
 				dst_data[0] = best_ref;
 				dst_data[1] = off1;
@@ -742,6 +899,8 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 				out_len += 7;
 			}
 			local_delta++;
+			/* delta does not set stride */
+			ctx->pred_stride = 0;
 			goto set_mode;
 		}
 
@@ -753,12 +912,365 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 		memcpy(dst_data, current_src, block_size);
 		dst_data += block_size;
 		out_len += block_size;
-		/* cur_sig already computed */
+		ctx->pred_stride = 0;   /* raw block resets stride */
 
 set_mode:
 		set_header_mode(header_ptr, i, mode);
 
-		/* Update history with cur_sig */
+		memcpy(ctx->prev_blocks[ctx->prev_index], current_src, block_size);
+		ctx->prev_sig[ctx->prev_index] = cur_sig;
+		ctx->prev_index = (ctx->prev_index + 1) % 4;
+
+		i++;
+	}
+
+	final_checksum = cinnamon_checksum(dst, out_len);
+	if (likely(out_len + sizeof(u64) <= *dst_len)) {
+		put_unaligned_le64(final_checksum, dst_data);
+		*dst_len = out_len + sizeof(u64);
+	} else {
+		goto fallback_raw;
+	}
+
+	atomic64_add(PAGE_SIZE, &cinnamon_bytes_in);
+	atomic64_add(*dst_len, &cinnamon_bytes_out);
+
+	/* Update statistics */
+	atomic_inc(&cinnamon_pages_compressed);
+	atomic_add(local_zero, &cinnamon_zero_blocks);
+	atomic_add(local_match, &cinnamon_match_blocks);
+	atomic_add(local_partial, &cinnamon_partial_blocks);
+	atomic_add(local_delta, &cinnamon_delta_blocks);
+	atomic_add(local_raw, &cinnamon_raw_blocks);
+
+	return 0;
+
+fallback_raw:
+	memcpy(dst, src, PAGE_SIZE);
+	*dst_len = PAGE_SIZE;
+	atomic_inc(&cinnamon_fallback_pages);
+	atomic64_add(PAGE_SIZE, &cinnamon_bytes_in);
+	atomic64_add(PAGE_SIZE, &cinnamon_bytes_out);
+	return 0;
+}
+#endif /* CONFIG_ARM64 */
+
+/* ---- Main compression function ---- */
+static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
+                             size_t *dst_len, void *private)
+{
+	/* C90: all declarations at the top */
+	int i;
+	unsigned char *header_ptr;
+	unsigned char *dst_data;
+	size_t out_len;
+	u64 final_checksum;
+	int block_size;
+	int blocks_per_page;
+	int header_size;
+	int half;
+	unsigned char mode;
+	int p;
+	u64 cur_sig;
+	int best_delta, best_ref;
+	int off1, off2, off3;
+	u8 val1, val2, val3;
+	u64 xor_sig;
+	int diff;
+	int prev_ref;
+	int run;
+	u8 repeat_value;
+	u8 next_val;
+	u64 repeat_sig;
+	int order[4];
+	int idx;
+	int local_zero, local_match, local_delta, local_raw, local_partial;
+	struct cinnamon_ctx *ctx = private;
+	u64 start_ns, end_ns, delta_ns;
+	cycles_t start_cycles, end_cycles, delta_cycles;
+#ifdef CONFIG_ARM64
+	bool use_neon_batch;
+	int ret;
+#endif
+	int stride_ref;
+	int d;
+
+	local_zero = local_match = local_delta = local_raw = local_partial = 0;
+
+	if (unlikely(!ctx))
+		return -EINVAL;
+
+	/* Use the tunable block size, ensuring it divides PAGE_SIZE */
+	block_size = cinnamon_block_size;
+	if (PAGE_SIZE % block_size != 0) {
+		block_size = 32;
+		if (PAGE_SIZE % block_size != 0)
+			block_size = 16;
+	}
+
+	blocks_per_page = PAGE_SIZE / block_size;
+	header_size = blocks_per_page / 2;
+
+	/* OPTIMIZATION: Try NEON batched path if conditions are met */
+#ifdef CONFIG_ARM64
+	use_neon_batch = use_neon && cinnamon_cpu_has_neon() &&
+			 ((unsigned long)src & 0xF) == 0 &&
+			 ((unsigned long)dst & 0xF) == 0;
+	if (use_neon_batch) {
+		kernel_neon_begin();
+		ret = cinnamon_compress_neon_batched(src, dst, dst_len, private,
+		                                     block_size, blocks_per_page);
+		kernel_neon_end();
+		return ret;
+	}
+#endif
+
+	/* Fallback to default (per‑block NEON or generic) */
+	if (*dst_len < 1 + header_size + 8)
+		goto fallback_raw;
+
+	dst[0] = (unsigned char)block_size;
+	header_ptr = dst + 1;
+	dst_data = header_ptr + header_size;
+	out_len = 1 + header_size;
+
+	memset(header_ptr, 0, header_size);
+	memset(ctx->prev_blocks, 0, sizeof(ctx->prev_blocks));
+	ctx->prev_index = 0;
+	ctx->pred_stride = 0;   /* initialize stride prediction */
+
+	start_ns = sched_clock();
+	start_cycles = get_cycles();
+
+	i = 0;
+	while (i < blocks_per_page) {
+		const u8 *current_src = src + (i * block_size);
+
+		if (i + 2 < blocks_per_page)
+			__builtin_prefetch(src + ((i + 2) * block_size), 0, 0);
+
+		/* --- Stride‑based prediction --- */
+		if (ctx->pred_stride > 0 && i >= ctx->pred_stride) {
+			stride_ref = (ctx->prev_index + (4 - ctx->pred_stride)) % 4;
+			if (blocks_match(current_src,
+					(const u8 *)ctx->prev_blocks[stride_ref], block_size)) {
+				mode = CINNAMON_MODE_MATCH0 + stride_ref;
+				cur_sig = ctx->prev_sig[stride_ref];
+				local_match++;
+				goto set_mode;
+			} else {
+				ctx->pred_stride = 0;
+			}
+		}
+
+		/* --- Zero‑run detection --- */
+		if (likely(is_zero_block(current_src, block_size))) {
+			run = 1;
+			while (i + run < blocks_per_page && run < 65535) {
+				if (i + run + 1 < blocks_per_page)
+					__builtin_prefetch(src + ((i + run + 1) * block_size), 0, 0);
+				if (!is_zero_block(src + ((i + run) * block_size), block_size))
+					break;
+				run++;
+			}
+
+			if (run <= 255) {
+				if (unlikely(out_len + 1 > *dst_len - sizeof(u64)))
+					goto fallback_raw;
+
+				mode = CINNAMON_MODE_ZERO_RUN;
+				set_header_mode(header_ptr, i, mode);
+				dst_data[0] = (unsigned char)run;
+				dst_data += 1;
+				out_len += 1;
+			} else {
+				if (unlikely(out_len + 2 > *dst_len - sizeof(u64)))
+					goto fallback_raw;
+
+				mode = CINNAMON_MODE_LONG_ZERO_RUN;
+				set_header_mode(header_ptr, i, mode);
+				put_unaligned_le16((u16)run, dst_data);
+				dst_data += 2;
+				out_len += 2;
+			}
+
+			local_zero += run;
+
+			for (p = 0; p < run; p++) {
+				memset(ctx->prev_blocks[ctx->prev_index], 0, block_size);
+				ctx->prev_sig[ctx->prev_index] = 0;
+				ctx->prev_index = (ctx->prev_index + 1) % 4;
+			}
+
+			ctx->pred_stride = 0;
+			i += run;
+			continue;
+		}
+
+		/* --- Repeat‑byte run detection --- */
+		if (is_repeat_byte_block(current_src, block_size, &repeat_value)) {
+			run = 1;
+			while (i + run < blocks_per_page && run < 255) {
+				if (i + run + 1 < blocks_per_page)
+					__builtin_prefetch(src + ((i + run + 1) * block_size), 0, 0);
+				if (!is_repeat_byte_block(src + ((i + run) * block_size), block_size, &next_val) ||
+				    next_val != repeat_value)
+					break;
+				run++;
+			}
+
+			if (unlikely(out_len + 2 > *dst_len - sizeof(u64)))
+				goto fallback_raw;
+
+			mode = CINNAMON_MODE_REPEAT_BYTE_RUN;
+			set_header_mode(header_ptr, i, mode);
+			dst_data[0] = repeat_value;
+			dst_data[1] = (unsigned char)run;
+			dst_data += 2;
+			out_len += 2;
+
+			repeat_sig = compute_block_signature(current_src, block_size);
+			for (p = 0; p < run; p++) {
+				memset(ctx->prev_blocks[ctx->prev_index], repeat_value, block_size);
+				ctx->prev_sig[ctx->prev_index] = repeat_sig;
+				ctx->prev_index = (ctx->prev_index + 1) % 4;
+			}
+
+			ctx->pred_stride = 0;
+			i += run;
+			continue;
+		}
+
+		/* --- Not a run, process single block --- */
+
+		/* Quick match with previous block (i-1) */
+		if (i > 0) {
+			prev_ref = (ctx->prev_index + 3) & 3;
+			if (blocks_match(current_src, (const u8 *)ctx->prev_blocks[prev_ref], block_size)) {
+				mode = CINNAMON_MODE_MATCH0 + prev_ref;
+				cur_sig = ctx->prev_sig[prev_ref];
+				local_match++;
+				ctx->pred_stride = 1;
+				goto set_mode;
+			}
+		}
+
+		/* Match with any of the 4 history blocks, most recent first */
+		order[0] = (ctx->prev_index + 3) % 4;
+		order[1] = (ctx->prev_index + 2) % 4;
+		order[2] = (ctx->prev_index + 1) % 4;
+		order[3] = ctx->prev_index;
+		for (idx = 0; idx < 4; idx++) {
+			p = order[idx];
+			if (blocks_match(current_src, (const u8 *)ctx->prev_blocks[p], block_size)) {
+				mode = CINNAMON_MODE_MATCH0 + p;
+				cur_sig = ctx->prev_sig[p];
+				local_match++;
+				d = ((ctx->prev_index + 3 - p) & 3) + 1;
+				ctx->pred_stride = d;
+				goto set_mode;
+			}
+		}
+
+		/* Try partial match (first half) */
+		half = block_size / 2;
+		for (p = 0; p < 4; p++) {
+			if (memcmp(current_src, ctx->prev_blocks[p], half) == 0) {
+				if (unlikely(out_len + 1 + half > *dst_len - sizeof(u64)))
+					goto fallback_raw;
+				mode = CINNAMON_MODE_MATCH16;
+				dst_data[0] = p;
+				memcpy(dst_data + 1, current_src + half, half);
+				dst_data += 1 + half;
+				out_len += 1 + half;
+				local_partial++;
+				cur_sig = compute_block_signature(current_src, block_size);
+				ctx->pred_stride = 0;
+				goto set_mode;
+			}
+		}
+
+		/* No match, compute signature for delta */
+		cur_sig = compute_block_signature(current_src, block_size);
+
+		/* Try delta compression */
+		best_delta = 4;
+		best_ref = -1;
+		for (p = 0; p < 4; p++) {
+			xor_sig = cur_sig ^ ctx->prev_sig[p];
+			if (__builtin_popcountll(xor_sig) > SIG_THRESHOLD)
+				continue;
+
+			diff = count_diff_bytes(current_src, (const u8 *)ctx->prev_blocks[p], block_size);
+			if (diff < best_delta) {
+				best_delta = diff;
+				best_ref = p;
+				if (best_delta == 0) break;
+				if (best_delta == 1) break;
+			}
+		}
+		if (best_ref >= 0 && best_delta <= 3) {
+			if (best_delta == 1) {
+				if (unlikely(out_len + 3 > *dst_len - sizeof(u64)))
+					goto fallback_raw;
+				mode = CINNAMON_MODE_DELTA1;
+				off1 = find_first_diff_byte(current_src,
+						(const u8 *)ctx->prev_blocks[best_ref], block_size);
+				val1 = current_src[off1];
+				dst_data[0] = best_ref;
+				dst_data[1] = off1;
+				dst_data[2] = val1;
+				dst_data += 3;
+				out_len += 3;
+			} else if (best_delta == 2) {
+				if (unlikely(out_len + 5 > *dst_len - sizeof(u64)))
+					goto fallback_raw;
+				mode = CINNAMON_MODE_DELTA2;
+				find_two_diff_bytes(current_src,
+				                    (const u8 *)ctx->prev_blocks[best_ref], block_size,
+				                    &off1, &val1, &off2, &val2);
+				dst_data[0] = best_ref;
+				dst_data[1] = off1;
+				dst_data[2] = val1;
+				dst_data[3] = off2;
+				dst_data[4] = val2;
+				dst_data += 5;
+				out_len += 5;
+			} else { /* delta == 3 */
+				if (unlikely(out_len + 7 > *dst_len - sizeof(u64)))
+					goto fallback_raw;
+				mode = CINNAMON_MODE_DELTA3;
+				find_three_diff_bytes(current_src,
+				                      (const u8 *)ctx->prev_blocks[best_ref], block_size,
+				                      &off1, &val1, &off2, &val2, &off3, &val3);
+				dst_data[0] = best_ref;
+				dst_data[1] = off1;
+				dst_data[2] = val1;
+				dst_data[3] = off2;
+				dst_data[4] = val2;
+				dst_data[5] = off3;
+				dst_data[6] = val3;
+				dst_data += 7;
+				out_len += 7;
+			}
+			local_delta++;
+			ctx->pred_stride = 0;
+			goto set_mode;
+		}
+
+		/* Fallback: raw block */
+		mode = CINNAMON_MODE_RAW;
+		local_raw++;
+		if (unlikely(out_len + block_size > *dst_len - sizeof(u64)))
+			goto fallback_raw;
+		memcpy(dst_data, current_src, block_size);
+		dst_data += block_size;
+		out_len += block_size;
+		ctx->pred_stride = 0;
+
+set_mode:
+		set_header_mode(header_ptr, i, mode);
+
 		memcpy(ctx->prev_blocks[ctx->prev_index], current_src, block_size);
 		ctx->prev_sig[ctx->prev_index] = cur_sig;
 		ctx->prev_index = (ctx->prev_index + 1) % 4;
@@ -809,6 +1321,7 @@ fallback_raw:
 static int cinnamon_decompress(const unsigned char *src, size_t src_len,
                                unsigned char *dst, void *dev_private)
 {
+	/* C90: all declarations at the top */
 	int i;
 	const unsigned char *header_ptr;
 	const unsigned char *src_data;
@@ -864,7 +1377,8 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 		mode = get_header_mode(header_ptr, i);
 		half = block_size / 2;
 
-		if (mode == CINNAMON_MODE_RAW) {
+		/* OPTIMIZATION: raw mode is unlikely when compression is effective */
+		if (unlikely(mode == CINNAMON_MODE_RAW)) {
 			if (unlikely(consumed_bytes + block_size > src_len - sizeof(u64)))
 				return -EINVAL;
 			memcpy(current_dst, src_data, block_size);
