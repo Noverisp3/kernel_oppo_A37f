@@ -35,7 +35,6 @@
 #define CINNAMON_HISTORY_SIZE 8
 #define CINNAMON_TARGET_LATENCY_MS 50   /* mục tiêu latency 50ms */
 #define CINNAMON_ADJUST_INTERVAL_MS 2000 /* điều chỉnh mỗi 2 giây */
-#define INTERACTIVE_TIMEOUT (HZ)  /* 1 giây */
 #define WRITE_STARVE_THRESH_NS 300000000ULL /* 300ms in nanoseconds */
 
 /* eMMC major number */
@@ -94,9 +93,6 @@ struct cinnamon_data {
 	int saved_read_batch;
 	int saved_write_batch;
 	int saved_write_expire_ms;
-	/* Interactive process tracking */
-	pid_t last_interactive_pid;
-	unsigned long interactive_expire;
 	struct request_queue *q;   /* để lấy ra_pages trong sysfs */
 	/* Dispatch sequence counter for optimization */
 	int dispatch_seq;
@@ -162,7 +158,7 @@ static void cinnamon_update_ra(struct cinnamon_data *cd, struct request_queue *q
 	if (curr_press != cd->last_ra_pressure) {
 		unsigned int ra_kb;
 		if (curr_press == 3) ra_kb = 128;
-		else if (curr_press == 0) ra_kb = 4096; /* Max read-ahead for Race to Sleep */
+		else if (curr_press == 0) ra_kb = 2048; /* Max read-ahead for Race to Sleep */
 		else if (curr_press <= 1) ra_kb = 2048;
 		else ra_kb = 512;
 		{
@@ -339,55 +335,6 @@ static void cinnamon_update_write_history(struct cinnamon_data *cd, sector_t sec
 		cd->predicted_write_sector = 0;
 		cd->last_write_direction = 0;
 	}
-}
-
-static bool is_interactive_process(struct cinnamon_data *cd, struct request *rq)
-{
-	pid_t pid = current->pid;
-	char comm[TASK_COMM_LEN];
-
-	/* Quick check for cached interactive process */
-	if (pid == cd->last_interactive_pid && time_before(jiffies, cd->interactive_expire))
-		return true;
-
-	/* Get process name for classification */
-	get_task_comm(comm, current);
-
-	/* Check for known interactive system processes */
-	if (strcmp(comm, "system_server") == 0 ||
-	    strcmp(comm, "surfaceflinger") == 0 ||
-	    strcmp(comm, "android.ui") == 0 ||
-	    strcmp(comm, "InputDispatcher") == 0 ||
-	    strcmp(comm, "systemui") == 0 ||
-	    strncmp(comm, "com.android.", 12) == 0 ||
-	    strcmp(comm, "zygote") == 0 ||
-	    strcmp(comm, "servicemanager") == 0) {
-		cd->last_interactive_pid = pid;
-		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
-		return true;
-	}
-
-	/* Check for real-time priority processes */
-	if (current->rt_priority > 0) {
-		cd->last_interactive_pid = pid;
-		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
-		return true;
-	}
-
-	/* Enhanced heuristic: small requests from non-nice processes */
-	if (blk_rq_bytes(rq) <= 16 * 1024 && task_nice(current) <= 5) {
-		cd->last_interactive_pid = pid;
-		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
-		return true;
-	}
-
-	/* Check for frequent small I/O pattern (interactive behavior) */
-	if (cd->last_interactive_pid == pid && blk_rq_bytes(rq) <= 64 * 1024) {
-		cd->interactive_expire = jiffies + INTERACTIVE_TIMEOUT;
-		return true;
-	}
-
-	return false;
 }
 
 static void cinnamon_merged_requests(struct request_queue *q, struct request *rq,
@@ -700,11 +647,6 @@ dispatch_read:
 		set_req_time(rq, 0);
 		cd->batch_count = 0;
 
-		/* Interactive boost */
-		if (is_interactive_process(cd, rq)) {
-			target_pressure = 1;
-		}
-
 		if (target_pressure != atomic_read(&cinnamon_io_pressure))
 			cinnamon_set_pressure(cd, q, target_pressure);
 
@@ -866,8 +808,6 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 	cd->saved_read_batch = cd->read_batch;
 	cd->saved_write_batch = cd->write_batch;
 	cd->saved_write_expire_ms = cd->write_expire_ms;
-	cd->last_interactive_pid = 0;
-	cd->interactive_expire = 0;
 	cd->last_manual_param_change_jiffies = jiffies;
 	cd->q = q;
 	cd->dispatch_seq = 0;
