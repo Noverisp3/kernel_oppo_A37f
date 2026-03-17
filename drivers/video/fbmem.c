@@ -40,15 +40,11 @@
      *  Frame buffer device initialization and setup routines
      */
 
-#define FBPIXMAPSIZE	(1024 * 16)
+#define FBPIXMAPSIZE	(1024 * 8)
 
 static DEFINE_MUTEX(registration_lock);
 struct fb_info *registered_fb[FB_MAX] __read_mostly;
 int num_registered_fb __read_mostly;
-
-/* Cinnamon: Pre-allocated framebuffer cache for faster operations */
-static void *fb_cache_pool[FB_MAX] __read_mostly __maybe_unused;
-static unsigned long fb_cache_size[FB_MAX] __read_mostly __maybe_unused;
 
 static struct fb_info *get_fb_info(unsigned int idx)
 {
@@ -458,25 +454,11 @@ static int fb_show_logo_line(struct fb_info *info, int rotate,
 	u32 *palette = NULL, *saved_pseudo_palette = NULL;
 	unsigned char *logo_new = NULL, *logo_rotate = NULL;
 	struct fb_image image;
-	unsigned int logo_size;
 
 	/* Return if the frame buffer is not mapped or suspended */
 	if (logo == NULL || info->state != FBINFO_STATE_RUNNING ||
 	    info->flags & FBINFO_MODULE)
 		return 0;
-
-	/* Cinnamon: Pre-allocate logo cache for faster rendering */
-	logo_size = logo->width * logo->height;
-	if (fb_cache_pool[info->node] && fb_cache_size[info->node] >= logo_size) {
-		logo_new = fb_cache_pool[info->node];
-	} else {
-		logo_new = kmalloc(logo_size, GFP_KERNEL);
-		if (logo_new) {
-			kfree(fb_cache_pool[info->node]);
-			fb_cache_pool[info->node] = logo_new;
-			fb_cache_size[info->node] = logo_size;
-		}
-	}
 
 	image.depth = 8;
 	image.data = logo->data;
@@ -500,7 +482,8 @@ static int fb_show_logo_line(struct fb_info *info, int rotate,
 	}
 
 	if (fb_logo.depth <= 4) {
-		if (!logo_new) {
+		logo_new = kmalloc(logo->width * logo->height, GFP_KERNEL);
+		if (logo_new == NULL) {
 			kfree(palette);
 			if (saved_pseudo_palette)
 				info->pseudo_palette = saved_pseudo_palette;
@@ -527,7 +510,7 @@ static int fb_show_logo_line(struct fb_info *info, int rotate,
 	kfree(palette);
 	if (saved_pseudo_palette != NULL)
 		info->pseudo_palette = saved_pseudo_palette;
-	/* Cinnamon: Don't free cached logo_new - it's in cache pool */
+	kfree(logo_new);
 	kfree(logo_rotate);
 	return logo->height;
 }
@@ -791,9 +774,6 @@ fb_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 	if (!buffer)
 		return -ENOMEM;
 
-	if (((unsigned long)buffer & 63) == 0)
-		buffer = __builtin_assume_aligned(buffer, 64);
-
 	src = (u8 __iomem *) (info->screen_base + p);
 
 	if (info->fbops->fb_sync)
@@ -864,9 +844,6 @@ fb_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 			 GFP_KERNEL);
 	if (!buffer)
 		return -ENOMEM;
-
-	if (((unsigned long)buffer & 63) == 0)
-		buffer = __builtin_assume_aligned(buffer, 64);
 
 	dst = (u8 __iomem *) (info->screen_base + p);
 

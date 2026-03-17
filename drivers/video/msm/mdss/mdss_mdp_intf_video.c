@@ -24,8 +24,8 @@
 #include "mdss_debug.h"
 #include "mdss_mdp_trace.h"
 
-/* wait for at least 2 vsyncs for lowest refresh rate (30hz) */
-#define VSYNC_TIMEOUT_US 66000
+/* wait for at least 2 vsyncs for lowest refresh rate (24hz) */
+#define VSYNC_TIMEOUT_US 100000
 
 /* Poll time to do recovery during active region */
 #define POLL_TIME_USEC_FOR_LN_CNT 500

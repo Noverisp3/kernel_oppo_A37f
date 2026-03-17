@@ -48,38 +48,14 @@ static void bit_bmove(struct vc_data *vc, struct fb_info *info, int sy,
 {
 	struct fb_copyarea area;
 
-	/* Cinnamon: Batch multiple small moves for better performance */
-	if (height * width <= 64) {
-		area.sx = sx * vc->vc_font.width;
-		area.sy = sy * vc->vc_font.height;
-		area.dx = dx * vc->vc_font.width;
-		area.dy = dy * vc->vc_font.height;
-		area.height = height * vc->vc_font.height;
-		area.width = width * vc->vc_font.width;
+	area.sx = sx * vc->vc_font.width;
+	area.sy = sy * vc->vc_font.height;
+	area.dx = dx * vc->vc_font.width;
+	area.dy = dy * vc->vc_font.height;
+	area.height = height * vc->vc_font.height;
+	area.width = width * vc->vc_font.width;
 
-		info->fbops->fb_copyarea(info, &area);
-	} else {
-		/* Large area - split into cache-friendly chunks */
-		int chunk_height = min(height, 32);
-		int remaining = height;
-		int current_y = sy, target_y = dy;
-		
-		while (remaining > 0) {
-			area.sx = sx * vc->vc_font.width;
-			area.sy = current_y * vc->vc_font.height;
-			area.dx = dx * vc->vc_font.width;
-			area.dy = target_y * vc->vc_font.height;
-			area.height = chunk_height * vc->vc_font.height;
-			area.width = width * vc->vc_font.width;
-
-			info->fbops->fb_copyarea(info, &area);
-			
-			current_y += chunk_height;
-			target_y += chunk_height;
-			remaining -= chunk_height;
-			chunk_height = min(remaining, 32);
-		}
-	}
+	info->fbops->fb_copyarea(info, &area);
 }
 
 static void bit_clear(struct vc_data *vc, struct fb_info *info, int sy,

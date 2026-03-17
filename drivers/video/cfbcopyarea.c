@@ -63,7 +63,7 @@ bitcpy(struct fb_info *p, unsigned long __iomem *dst, unsigned dst_idx,
 	first = fb_shifted_pixels_mask_long(p, dst_idx, bswapmask);
 	last = ~fb_shifted_pixels_mask_long(p, (dst_idx+n) % bits, bswapmask);
 
-	if (likely(!shift)) {
+	if (!shift) {
 		// Same alignment for source and dest
 
 		if (dst_idx+n <= bits) {
@@ -82,9 +82,9 @@ bitcpy(struct fb_info *p, unsigned long __iomem *dst, unsigned dst_idx,
 				n -= bits - dst_idx;
 			}
 
-			// Main chunk - optimized for ARM cache line (64 bytes)
+			// Main chunk
 			n /= bits;
-			while (n >= 16) {
+			while (n >= 8) {
 				FB_WRITEL(FB_READL(src++), dst++);
 				FB_WRITEL(FB_READL(src++), dst++);
 				FB_WRITEL(FB_READL(src++), dst++);
@@ -93,21 +93,7 @@ bitcpy(struct fb_info *p, unsigned long __iomem *dst, unsigned dst_idx,
 				FB_WRITEL(FB_READL(src++), dst++);
 				FB_WRITEL(FB_READL(src++), dst++);
 				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				n -= 16;
-			}
-			while (n >= 4) {
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				FB_WRITEL(FB_READL(src++), dst++);
-				n -= 4;
+				n -= 8;
 			}
 			while (n--)
 				FB_WRITEL(FB_READL(src++), dst++);
@@ -250,7 +236,7 @@ bitcpy_rev(struct fb_info *p, unsigned long __iomem *dst, unsigned dst_idx,
 	first = ~fb_shifted_pixels_mask_long(p, (dst_idx + 1) % bits, bswapmask);
 	last = fb_shifted_pixels_mask_long(p, (bits + dst_idx + 1 - n) % bits, bswapmask);
 
-	if (likely(!shift)) {
+	if (!shift) {
 		// Same alignment for source and dest
 
 		if ((unsigned long)dst_idx+1 >= n) {
@@ -269,9 +255,9 @@ bitcpy_rev(struct fb_info *p, unsigned long __iomem *dst, unsigned dst_idx,
 				n -= dst_idx+1;
 			}
 
-			// Main chunk - optimized for ARM cache line (64 bytes)
+			// Main chunk
 			n /= bits;
-			while (n >= 16) {
+			while (n >= 8) {
 				FB_WRITEL(FB_READL(src--), dst--);
 				FB_WRITEL(FB_READL(src--), dst--);
 				FB_WRITEL(FB_READL(src--), dst--);
@@ -280,22 +266,7 @@ bitcpy_rev(struct fb_info *p, unsigned long __iomem *dst, unsigned dst_idx,
 				FB_WRITEL(FB_READL(src--), dst--);
 				FB_WRITEL(FB_READL(src--), dst--);
 				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				n -= 16;
-			}
-			while (n >= 4) {
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				FB_WRITEL(FB_READL(src--), dst--);
-				n -= 4;
+				n -= 8;
 			}
 			while (n--)
 				FB_WRITEL(FB_READL(src--), dst--);

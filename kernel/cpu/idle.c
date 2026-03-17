@@ -44,10 +44,8 @@ static inline int cpu_idle_poll(void)
 	rcu_idle_enter();
 	trace_cpu_idle_rcuidle(0, smp_processor_id());
 	local_irq_enable();
-	while (!tif_need_resched()) {
+	while (!tif_need_resched())
 		cpu_relax();
-		cpu_relax(); /* Double relax for better responsiveness */
-	}
 	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, smp_processor_id());
 	rcu_idle_exit();
 	return 1;
