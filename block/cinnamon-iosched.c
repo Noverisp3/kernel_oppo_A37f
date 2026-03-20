@@ -6,13 +6,20 @@
  * 2. Anti-Starvation: Forces writes if delayed > 125ms to prevent FS locking.
  * 3. Smart Batching: Dynamic pressure reporting to zcomp backend.
  * 4. Dynamic Read-Ahead: Adjusts read-ahead based on I/O pressure.
- * 5. Hysteresis: Smooths pressure transitions to prevent jitter.
+ * 5. Hysteresis: Smooths pressure transitions with moving average.
  * 6. Per-Queue State: Ensures SMP safety with isolated state per device.
  * 7. Latency Monitoring: Tracks and exposes average request latency via sysfs.
  * 8. Moving Average: Smooth latency reporting with historical weighting.
  * 9. TRIM Priority: Dedicated queue for DISCARD commands (avoids fsync delays).
- * 10. Starvation Counter & Auto-Recovery: Detects severe write starvation (>300ms)
+ * 10. Starvation Counter & Auto-Recovery: Detects severe write starvation (>150ms)
  *     and temporarily reduces read_batch to 4 for 2 seconds.
+ * 11. Tiered Queuing: Critical (metadata/prio), Read/Write Foreground, Background.
+ * 12. O(1) Merge: Limits merge scan to 8 entries per queue to avoid O(n) overhead.
+ * 13. Latency-Aware Throttling: Adjusts batch sizes based on average latency.
+ * 14. eMMC Sequential Write Boost: Detects sequential writes and prioritizes them.
+ * 15. Background Starvation Prevention: Forces a background request after 16 foreground dispatches.
+ * 16. Smooth Read-Ahead Transition: Gradual adjustment of ra_pages to avoid jitter.
+ * 17. Priority Storage in Request: Combines timestamp and priority in elv.priv.
  */
 
 #include <linux/blkdev.h>
@@ -24,116 +31,148 @@
 #include <linux/jiffies.h>
 #include <linux/backing-dev.h>
 #include <linux/ktime.h>
-#include <linux/fs.h>          /* for disk_devt */
-#include <linux/genhd.h>       /* for disk_devt */
+#include <linux/fs.h>
+#include <linux/genhd.h>
 
-/* TUNABLES */
-#define CINNAMON_WRITE_EXPIRE  (HZ / 8)  /* 125ms - Faster response */
-#define CINNAMON_READ_BATCH    8        /* Smaller for read to allow write interleaving */
-#define CINNAMON_WRITE_BATCH   16       /* Larger for write to maximize sequential throughput */
-#define CINNAMON_PRESSURE_THRES 24       /* Lower threshold for earlier pressure reporting */
-#define CINNAMON_HISTORY_SIZE 8
-#define CINNAMON_TARGET_LATENCY_MS 50   /* mục tiêu latency 50ms */
-#define CINNAMON_ADJUST_INTERVAL_MS 2000 /* điều chỉnh mỗi 2 giây */
-#define WRITE_STARVE_THRESH_NS 300000000ULL /* 300ms in nanoseconds */
+/* Tunables */
+#define CINNAMON_WRITE_EXPIRE      (HZ / 8)      /* 125ms */
+#define CINNAMON_READ_BATCH        8
+#define CINNAMON_WRITE_BATCH        16
+#define CINNAMON_PRESSURE_THRES     24
+#define CINNAMON_HYSTERESIS_MS     500           /* 500ms hysteresis */
+#define CINNAMON_HISTORY_SIZE       8
+#define CINNAMON_TARGET_LATENCY_MS  50
+#define CINNAMON_ADJUST_INTERVAL_MS 2000
+#define WRITE_STARVE_THRESH_NS      150000000ULL  /* 150ms (stricter) */
+#define MAX_MERGE_SCAN               8             /* O(1) merge scan limit */
+#define FG_STARVE_LIMIT              16            /* Max foreground dispatches before forcing background */
 
-/* eMMC major number */
-#define EMMC_MAJOR 179
+#define EMMC_MAJOR                   179
+#define EMMC_MAX_BATCH                16
+#define EMMC_MIN_PRESSURE_THRES       12
+#define EMMC_MAX_PRESSURE_THRES       24
 
-/* eMMC specific caps */
-#define EMMC_MAX_BATCH 16
-#define EMMC_MIN_PRESSURE_THRES 12
-#define EMMC_MAX_PRESSURE_THRES 24
+/* Priority levels for tiered queuing */
+enum io_priority {
+	PRIO_CRITICAL = 0,   /* Metadata, high-priority */
+	PRIO_TRIM,            /* Discard commands */
+	PRIO_READ_FG,         /* Foreground reads */
+	PRIO_WRITE_FG,        /* Foreground writes */
+	PRIO_READ_BG,         /* Background reads */
+	PRIO_WRITE_BG,        /* Background writes */
+	PRIO_COUNT
+};
+
+/* Shift and mask for storing priority with timestamp */
+#define CINNAMON_PRIO_SHIFT 8
+#define CINNAMON_PRIO_MASK ((1 << CINNAMON_PRIO_SHIFT) - 1)
 
 struct cinnamon_data {
-	struct list_head read_queue;
-	struct list_head write_queue;
-	struct list_head trim_queue;          /* dedicated queue for DISCARD */
+	/* Tiered queues */
+	struct list_head queues[PRIO_COUNT];
+	unsigned int queue_counts[PRIO_COUNT];
+
+	/* Batching state */
 	unsigned int batch_count;
-	/* Stats for pressure monitoring */
-	int write_cnt;
-	int read_cnt;
-	int trim_cnt;                          /* counter for TRIM requests */
-	/* Read batch counter for write interleaving */
-	unsigned int read_batch_count;
-	/* Latency tracking (in ns) */
+	unsigned int read_batch_count;   /* tracks reads in current cycle */
+	unsigned int fg_dispatch_count;  /* consecutive foreground dispatches */
+
+	/* Latency tracking (ns) */
 	atomic64_t total_latency_ns;
 	atomic_t num_requests;
-	/* Per-queue read-ahead pressure tracking */
+
+	/* Pressure & read-ahead */
 	int last_ra_pressure;
-	/* Per-queue hysteresis timing */
 	unsigned long last_pressure_change_jiffies;
-	/* Parameter change tracking to avoid conflicts */
 	unsigned long last_manual_param_change_jiffies;
-	/* Tunable parameters */
+
+	/* Tunable parameters (per-queue) */
 	int write_expire_ms;
 	int read_batch;
 	int write_batch;
 	int pressure_thres;
 	int hysteresis_ms;
-	/* History for read pattern detection */
+
+	/* Read pattern history */
 	sector_t read_history[CINNAMON_HISTORY_SIZE];
 	int history_index;
 	int history_count;
-	/* Last read direction: 1 forward, -1 backward, 0 unknown */
 	int last_read_direction;
-	/* Predicted next sector (0 if no prediction) */
 	sector_t predicted_sector;
-	/* History for write pattern detection */
+
+	/* Write pattern history */
 	sector_t write_history[CINNAMON_HISTORY_SIZE];
 	int write_history_index;
 	int write_history_count;
 	int last_write_direction;
 	sector_t predicted_write_sector;
+
 	/* Adaptive tuning */
 	unsigned long last_adjust_jiffies;
 	int target_latency_ms;
 	int adjust_interval_ms;
-	/* Tham số tạm thời cho Race to Idle */
+
+	/* Saved parameters for idle mode */
 	int saved_read_batch;
 	int saved_write_batch;
 	int saved_write_expire_ms;
-	struct request_queue *q;   /* để lấy ra_pages trong sysfs */
-	/* Dispatch sequence counter for optimization */
+
+	struct request_queue *q;   /* for ra_pages access */
 	int dispatch_seq;
-	/* Per-queue empty dispatch counter (replaces static) */
 	int empty_dispatch_count;
-	/* eMMC mode detection / forcing */
 	bool emmc_mode;
 
-	/* --- Starvation counter & auto-recovery --- */
-	unsigned int write_starved_count;       /* number of severe starvations (>300ms) */
-	unsigned long last_starved_jiffies;     /* last time such starvation occurred */
-	unsigned long starvation_recovery_until; /* jiffies when recovery ends (0 = not active) */
-	int saved_read_batch_for_starve;        /* read_batch saved before recovery */
+	/* Starvation auto-recovery */
+	unsigned int write_starved_count;
+	unsigned long last_starved_jiffies;
+	unsigned long starvation_recovery_until;
+	int saved_read_batch_for_starve;
+
+	/* Sequential write detection boost */
+	unsigned int seq_write_count;
+	sector_t last_write_sector;
 };
 
-/* Global atomic variable for CC engine */
+/* Global pressure indicator */
 atomic_t cinnamon_io_pressure = ATOMIC_INIT(0);
 EXPORT_SYMBOL(cinnamon_io_pressure);
 
-#define CINNAMON_HYSTERESIS_MS 40
-
-/* Helpers for storing/retrieving 64-bit ns timestamps in elv.priv[] */
-static inline void set_req_time(struct request *rq, u64 time_ns)
+/* Helpers for storing/retrieving 64-bit timestamps and priority in elv.priv[] */
+static inline void set_req_time_and_prio(struct request *rq, u64 time_ns, int prio)
 {
+	u64 val = (time_ns << CINNAMON_PRIO_SHIFT) | (prio & CINNAMON_PRIO_MASK);
 #if BITS_PER_LONG == 64
-	rq->elv.priv[0] = (void *)time_ns;
+	rq->elv.priv[0] = (void *)val;
 #else
-	rq->elv.priv[0] = (void *)(unsigned long)(time_ns & 0xFFFFFFFF);
-	rq->elv.priv[1] = (void *)(unsigned long)(time_ns >> 32);
+	rq->elv.priv[0] = (void *)(unsigned long)(val & 0xFFFFFFFF);
+	rq->elv.priv[1] = (void *)(unsigned long)(val >> 32);
 #endif
 }
 
 static inline u64 get_req_time(struct request *rq)
 {
+	u64 val;
 #if BITS_PER_LONG == 64
-	return (u64)(unsigned long)rq->elv.priv[0];
+	val = (u64)(unsigned long)rq->elv.priv[0];
 #else
 	u64 low = (u64)(unsigned long)rq->elv.priv[0];
 	u64 high = (u64)(unsigned long)rq->elv.priv[1];
-	return (high << 32) | low;
+	val = (high << 32) | low;
 #endif
+	return val >> CINNAMON_PRIO_SHIFT;
+}
+
+static inline int get_req_prio(struct request *rq)
+{
+	u64 val;
+#if BITS_PER_LONG == 64
+	val = (u64)(unsigned long)rq->elv.priv[0];
+#else
+	u64 low = (u64)(unsigned long)rq->elv.priv[0];
+	u64 high = (u64)(unsigned long)rq->elv.priv[1];
+	val = (high << 32) | low;
+#endif
+	return val & CINNAMON_PRIO_MASK;
 }
 
 /* Clamp tunables for eMMC */
@@ -141,53 +180,68 @@ static void cinnamon_clamp_for_emmc(struct cinnamon_data *cd)
 {
 	if (!cd->emmc_mode)
 		return;
-
-	if (cd->read_batch > EMMC_MAX_BATCH)
-		cd->read_batch = EMMC_MAX_BATCH;
-	if (cd->write_batch > EMMC_MAX_BATCH)
-		cd->write_batch = EMMC_MAX_BATCH;
-	if (cd->pressure_thres < EMMC_MIN_PRESSURE_THRES)
-		cd->pressure_thres = EMMC_MIN_PRESSURE_THRES;
-	if (cd->pressure_thres > EMMC_MAX_PRESSURE_THRES)
-		cd->pressure_thres = EMMC_MAX_PRESSURE_THRES;
+	cd->read_batch = min(cd->read_batch, EMMC_MAX_BATCH);
+	cd->write_batch = min(cd->write_batch, EMMC_MAX_BATCH);
+	cd->pressure_thres = clamp(cd->pressure_thres,
+				    EMMC_MIN_PRESSURE_THRES,
+				    EMMC_MAX_PRESSURE_THRES);
 }
 
-static void cinnamon_update_ra(struct cinnamon_data *cd, struct request_queue *q)
+/* Update read-ahead based on global pressure with smoothing */
+static void cinnamon_update_ra(struct cinnamon_data *cd)
 {
 	int curr_press = atomic_read(&cinnamon_io_pressure);
 	if (curr_press != cd->last_ra_pressure) {
 		unsigned int ra_kb;
-		if (curr_press == 3) ra_kb = 128;
-		else if (curr_press == 0) ra_kb = 2048; /* Max read-ahead for Race to Sleep */
-		else if (curr_press <= 1) ra_kb = 2048;
-		else ra_kb = 512;
-		{
-			unsigned int ra_pages = ra_kb >> (PAGE_SHIFT - 10);
-			q->backing_dev_info.ra_pages = clamp(ra_pages, 16U, 4096U);
+		unsigned long target_ra_pages;
+		unsigned long current_ra = cd->q->backing_dev_info.ra_pages;
+
+		switch (curr_press) {
+		case 3:
+			ra_kb = 128;
+			break;
+		case 2:
+			ra_kb = 512;
+			break;
+		case 1:
+			ra_kb = 1024;
+			break;
+		default:
+			ra_kb = 2048;
+			break;
 		}
+		target_ra_pages = ra_kb >> (PAGE_SHIFT - 10);
+
+		/* Smooth transition: adjust by at most 16 pages per step */
+		if (current_ra < target_ra_pages)
+			current_ra = min(current_ra + 16, target_ra_pages);
+		else if (current_ra > target_ra_pages)
+			current_ra = max(current_ra - 16, target_ra_pages);
+
+		cd->q->backing_dev_info.ra_pages = current_ra;
 		cd->last_ra_pressure = curr_press;
 	}
 }
 
-static void cinnamon_set_pressure(struct cinnamon_data *cd, struct request_queue *q, int new_pressure)
+/* Set global pressure with hysteresis and idle mode */
+static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 {
 	int old_pressure, curr_pressure;
 	int changed = 0;
 
 	do {
 		curr_pressure = atomic_read(&cinnamon_io_pressure);
-
 		if (new_pressure == curr_pressure)
 			return;
 
-		/* Cho phép set về 0 (idle) bất kỳ lúc nào */
+		/* Always allow dropping to idle (0) */
 		if (new_pressure == 0) {
-			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure, curr_pressure, 0);
+			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure,
+						       curr_pressure, 0);
 			if (old_pressure == curr_pressure) {
 				cd->last_pressure_change_jiffies = jiffies;
 				changed = 1;
-
-				/* Khôi phục tham số nếu đang ở chế độ idle */
+				/* Restore saved parameters when leaving non-idle */
 				if (curr_pressure != 0) {
 					cd->read_batch = cd->saved_read_batch;
 					cd->write_batch = cd->saved_write_batch;
@@ -197,19 +251,21 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, struct request_queue
 			break;
 		}
 
-		/* Kiểm tra hysteresis */
-		if (!time_after(jiffies, cd->last_pressure_change_jiffies + msecs_to_jiffies(cd->hysteresis_ms)))
+		/* Hysteresis check for non-idle transitions */
+		if (!time_after(jiffies, cd->last_pressure_change_jiffies +
+				msecs_to_jiffies(cd->hysteresis_ms)))
 			return;
 
-		/* Ưu tiên: chỉ tăng áp lực hoặc từ 0 lên non-zero */
+		/* Only allow increasing pressure or from 0 to non-zero */
 		if (curr_pressure == 0 || new_pressure > curr_pressure) {
-			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure, curr_pressure, new_pressure);
+			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure,
+						       curr_pressure, new_pressure);
 			if (old_pressure == curr_pressure) {
 				cd->last_pressure_change_jiffies = jiffies;
 				changed = 1;
 
-				/* Xử lý khi vào idle */
 				if (new_pressure == 0) {
+					/* Entering idle: save and halve parameters */
 					cd->saved_read_batch = cd->read_batch;
 					cd->saved_write_batch = cd->write_batch;
 					cd->saved_write_expire_ms = cd->write_expire_ms;
@@ -217,23 +273,24 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, struct request_queue
 					cd->write_batch = max(cd->write_batch / 2, 8);
 					cd->write_expire_ms = min(cd->write_expire_ms + 100, 300);
 				} else if (curr_pressure == 0) {
+					/* Leaving idle: restore saved */
 					cd->read_batch = cd->saved_read_batch;
 					cd->write_batch = cd->saved_write_batch;
 					cd->write_expire_ms = cd->saved_write_expire_ms;
 				}
-				/* Clamp if eMMC */
 				cinnamon_clamp_for_emmc(cd);
 			}
 		} else {
-			/* Không cho phép giảm áp lực (trừ về 0 đã xử lý ở trên) */
+			/* Prevent decreasing pressure (except to idle) */
 			return;
 		}
 	} while (!changed);
 
 	if (changed)
-		cinnamon_update_ra(cd, q);
+		cinnamon_update_ra(cd);
 }
 
+/* Update read history with confidence-based prediction */
 static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sector)
 {
 	cd->read_history[cd->history_index] = sector;
@@ -241,19 +298,17 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 	if (cd->history_count < CINNAMON_HISTORY_SIZE)
 		cd->history_count++;
 
-	/* Enhanced prediction with confidence metric */
 	if (cd->history_count >= 3) {
 		int i, consistent = 0, total_diffs = 0;
 		sector_t avg_diff = 0, min_diff = 0, max_diff = 0;
 		int idx = (cd->history_index - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 		int confidence;
-		
-		/* Calculate differences and statistics */
+
 		for (i = 1; i < min(5, cd->history_count); i++) {
 			int cur = (cd->history_index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 			int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 			sector_t diff = cd->read_history[cur] - cd->read_history[prev];
-			
+
 			if (i == 1) {
 				min_diff = max_diff = diff;
 				avg_diff = diff;
@@ -263,22 +318,16 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 				avg_diff = (avg_diff * (i-1) + diff) / i;
 			}
 			total_diffs++;
-			
-			/* Check consistency within reasonable bounds */
 			if (abs(diff - avg_diff) < 1024)
 				consistent++;
 		}
-		
-		/* Calculate confidence (0-100) */
+
 		confidence = consistent * 100 / total_diffs;
-		
-		/* Only predict if confidence is high and pattern is sequential */
-		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 && 
+		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 &&
 		    avg_diff != 0 && abs(avg_diff) < 1048576) {
 			cd->predicted_sector = cd->read_history[idx] + avg_diff;
 			cd->last_read_direction = avg_diff > 0 ? 1 : -1;
 		} else {
-			/* Random I/O detected - disable prediction */
 			cd->predicted_sector = 0;
 			cd->last_read_direction = 0;
 		}
@@ -288,6 +337,7 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 	}
 }
 
+/* Update write history similarly */
 static void cinnamon_update_write_history(struct cinnamon_data *cd, sector_t sector)
 {
 	cd->write_history[cd->write_history_index] = sector;
@@ -295,18 +345,17 @@ static void cinnamon_update_write_history(struct cinnamon_data *cd, sector_t sec
 	if (cd->write_history_count < CINNAMON_HISTORY_SIZE)
 		cd->write_history_count++;
 
-	/* Similar prediction for writes */
 	if (cd->write_history_count >= 3) {
 		int i, consistent = 0, total_diffs = 0;
 		sector_t avg_diff = 0, min_diff = 0, max_diff = 0;
 		int idx = (cd->write_history_index - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 		int confidence;
-		
+
 		for (i = 1; i < min(5, cd->write_history_count); i++) {
 			int cur = (cd->write_history_index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 			int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 			sector_t diff = cd->write_history[cur] - cd->write_history[prev];
-			
+
 			if (i == 1) {
 				min_diff = max_diff = diff;
 				avg_diff = diff;
@@ -316,14 +365,12 @@ static void cinnamon_update_write_history(struct cinnamon_data *cd, sector_t sec
 				avg_diff = (avg_diff * (i-1) + diff) / i;
 			}
 			total_diffs++;
-			
 			if (abs(diff - avg_diff) < 1024)
 				consistent++;
 		}
-		
+
 		confidence = consistent * 100 / total_diffs;
-		
-		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 && 
+		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 &&
 		    avg_diff != 0 && abs(avg_diff) < 1048576) {
 			cd->predicted_write_sector = cd->write_history[idx] + avg_diff;
 			cd->last_write_direction = avg_diff > 0 ? 1 : -1;
@@ -335,28 +382,20 @@ static void cinnamon_update_write_history(struct cinnamon_data *cd, sector_t sec
 		cd->predicted_write_sector = 0;
 		cd->last_write_direction = 0;
 	}
-}
 
-static void cinnamon_merged_requests(struct request_queue *q, struct request *rq,
-				      struct request *next)
-{
-	struct cinnamon_data *cd = q->elevator->elevator_data;
-
-	list_del_init(&next->queuelist);
-	
-	if (next->cmd_flags & REQ_DISCARD) {
-		if (cd->trim_cnt > 0)
-			cd->trim_cnt--;
-	} else if (rq_data_dir(next) == WRITE) {
-		if (cd->write_cnt > 0)
-			cd->write_cnt--;
-	} else {
-		if (cd->read_cnt > 0)
-			cd->read_cnt--;
+	/* Sequential write detection for eMMC boost */
+	if (cd->last_write_direction != 0 && cd->last_write_sector != 0) {
+		if (sector == cd->last_write_sector + 1)
+			cd->seq_write_count++;
+		else
+			cd->seq_write_count = 0;
 	}
+	cd->last_write_sector = sector;
 }
 
-static int cinnamon_merge(struct request_queue *q, struct request **req, struct bio *bio)
+/* Merge function with O(1) scan limit */
+static int cinnamon_merge(struct request_queue *q, struct request **req,
+			  struct bio *bio)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 	int dir = bio_data_dir(bio);
@@ -364,69 +403,139 @@ static int cinnamon_merge(struct request_queue *q, struct request **req, struct 
 	sector_t last_sector = sector + bio_sectors(bio);
 	struct list_head *queue_head;
 	struct request *rq_iter;
+	int scanned = 0;
 
-	/* Choose appropriate queue based on bio direction */
 	if (dir == READ) {
-		if (list_empty(&cd->read_queue))
+		if (!list_empty(&cd->queues[PRIO_READ_FG]))
+			queue_head = &cd->queues[PRIO_READ_FG];
+		else if (!list_empty(&cd->queues[PRIO_READ_BG]))
+			queue_head = &cd->queues[PRIO_READ_BG];
+		else
 			return ELEVATOR_NO_MERGE;
-		queue_head = &cd->read_queue;
 	} else {
-		if (list_empty(&cd->write_queue))
+		if (!list_empty(&cd->queues[PRIO_WRITE_FG]))
+			queue_head = &cd->queues[PRIO_WRITE_FG];
+		else if (!list_empty(&cd->queues[PRIO_WRITE_BG]))
+			queue_head = &cd->queues[PRIO_WRITE_BG];
+		else
 			return ELEVATOR_NO_MERGE;
-		queue_head = &cd->write_queue;
 	}
 
-	/* Scan entire queue for best merge opportunity */
 	list_for_each_entry(rq_iter, queue_head, queuelist) {
 		sector_t rq_sector = blk_rq_pos(rq_iter);
 		sector_t rq_last_sector = rq_sector + blk_rq_sectors(rq_iter);
 
-		/* Check for back merge: bio starts exactly after request ends */
 		if (sector == rq_last_sector) {
 			*req = rq_iter;
 			return ELEVATOR_BACK_MERGE;
 		}
-
-		/* Check for front merge: bio ends exactly at request start */
 		if (last_sector == rq_sector) {
 			*req = rq_iter;
 			return ELEVATOR_FRONT_MERGE;
 		}
+		if (++scanned >= MAX_MERGE_SCAN)
+			break;
 	}
 
 	return ELEVATOR_NO_MERGE;
 }
 
-static void cinnamon_adjust_params(struct cinnamon_data *cd, struct request_queue *q)
+/* Handle merged requests - now correctly decrement queue count */
+static void cinnamon_merged_requests(struct request_queue *q, struct request *rq,
+				      struct request *next)
+{
+	struct cinnamon_data *cd = q->elevator->elevator_data;
+	int prio = get_req_prio(next);
+
+	if (prio >= 0 && prio < PRIO_COUNT) {
+		if (cd->queue_counts[prio] > 0)
+			cd->queue_counts[prio]--;
+	}
+	list_del_init(&next->queuelist);
+}
+
+/* Add request to appropriate tiered queue */
+static void cinnamon_add_request(struct request_queue *q, struct request *rq)
+{
+	struct cinnamon_data *cd = q->elevator->elevator_data;
+	int prio;
+
+	if (rq->cmd_flags & REQ_DISCARD) {
+		prio = PRIO_TRIM;
+	} else if (rq->cmd_flags & (REQ_META | REQ_PRIO)) {
+		prio = PRIO_CRITICAL;
+	} else {
+		int dir = rq_data_dir(rq);
+		if (rq->cmd_flags & REQ_SYNC) {
+			prio = (dir == READ) ? PRIO_READ_FG : PRIO_WRITE_FG;
+		} else {
+			prio = (dir == READ) ? PRIO_READ_BG : PRIO_WRITE_BG;
+		}
+	}
+
+	set_req_time_and_prio(rq, ktime_to_ns(ktime_get()), prio);
+
+	/* Sync requests go to head for faster service */
+	if (rq->cmd_flags & REQ_SYNC)
+		list_add(&rq->queuelist, &cd->queues[prio]);
+	else
+		list_add_tail(&rq->queuelist, &cd->queues[prio]);
+
+	cd->queue_counts[prio]++;
+}
+
+/* Update latency moving average */
+static void cinnamon_update_latency(struct cinnamon_data *cd, u64 latency_ns)
+{
+	u64 old_avg = atomic64_read(&cd->total_latency_ns);
+	int old_count = atomic_read(&cd->num_requests);
+
+	if (old_count > 0) {
+		u64 new_avg = (old_avg * 7 + latency_ns * 3) / 10;
+		atomic64_set(&cd->total_latency_ns, new_avg);
+	} else {
+		atomic64_set(&cd->total_latency_ns, latency_ns);
+	}
+
+	if (old_count < 100)
+		atomic_set(&cd->num_requests, old_count + 1);
+	else
+		atomic_set(&cd->num_requests, old_count / 2);
+}
+
+/* Adaptive parameter tuning based on latency and queue depth */
+static void cinnamon_adjust_params(struct cinnamon_data *cd)
 {
 	unsigned long now = jiffies;
 	u64 total_ns;
 	int num, avg_latency_ms;
-	int queue_depth = cd->read_cnt + cd->write_cnt;
-	int read_ratio = queue_depth ? (cd->read_cnt * 100) / queue_depth : 50;
+	int queue_depth = 0;
+	int i;
+	int read_cnt, write_cnt, total_io;
+	int read_ratio;
 
-	/* Skip adjustment if manual parameter changes happened recently (< 5 seconds) */
-	if (time_before(now, cd->last_manual_param_change_jiffies + msecs_to_jiffies(5000)))
+	if (time_before(now, cd->last_manual_param_change_jiffies +
+			msecs_to_jiffies(5000)))
 		return;
 
-	/* Chỉ điều chỉnh sau mỗi khoảng thời gian */
-	if (time_before(now, cd->last_adjust_jiffies + msecs_to_jiffies(cd->adjust_interval_ms)))
+	if (time_before(now, cd->last_adjust_jiffies +
+			msecs_to_jiffies(cd->adjust_interval_ms)))
 		return;
 
 	cd->last_adjust_jiffies = now;
 
-	/* Tính độ trễ trung bình gần đây (ns -> ms) */
 	total_ns = atomic64_read(&cd->total_latency_ns);
 	num = atomic_read(&cd->num_requests);
 	if (num == 0)
 		return;
+	avg_latency_ms = div64_u64(total_ns / num, 1000000);
 
-	avg_latency_ms = div64_u64(total_ns / num, 1000000); /* ns to ms */
+	for (i = 0; i < PRIO_COUNT; i++)
+		queue_depth += cd->queue_counts[i];
 
-	/* Điều chỉnh dựa trên latency so với mục tiêu */
 	if (avg_latency_ms > cd->target_latency_ms * 2) {
-		cd->read_batch = max(cd->read_batch / 2, 6);
-		cd->write_batch = max(cd->write_batch / 2, 6);
+		cd->read_batch = max(cd->read_batch / 2, 4);
+		cd->write_batch = max(cd->write_batch / 2, 4);
 		cd->write_expire_ms = max(cd->write_expire_ms / 2, 10);
 		cd->pressure_thres = max(cd->pressure_thres / 2, 8);
 	} else if (avg_latency_ms < cd->target_latency_ms / 2) {
@@ -436,28 +545,34 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd, struct request_queu
 		cd->pressure_thres = min(cd->pressure_thres * 2, 48);
 	}
 
-	/* Điều chỉnh thêm dựa trên tỉ lệ đọc/ghi */
-	if (read_ratio > 70) {
-		cd->read_batch = min(cd->read_batch * 2, 32);
-	} else if (read_ratio < 30) {
-		cd->write_batch = min(cd->write_batch * 2, 32);
+	read_cnt = cd->queue_counts[PRIO_READ_FG] +
+		  cd->queue_counts[PRIO_READ_BG] +
+		  cd->queue_counts[PRIO_CRITICAL];
+	write_cnt = cd->queue_counts[PRIO_WRITE_FG] +
+		   cd->queue_counts[PRIO_WRITE_BG];
+	total_io = read_cnt + write_cnt;
+
+	if (total_io > 0) {
+		read_ratio = read_cnt * 100 / total_io;
+		if (read_ratio > 70)
+			cd->read_batch = min(cd->read_batch * 2, 32);
+		else if (read_ratio < 30)
+			cd->write_batch = min(cd->write_batch * 2, 32);
 	}
 
-	/* Điều chỉnh dựa trên độ sâu hàng đợi */
 	if (queue_depth > cd->pressure_thres * 2) {
-		cd->read_batch = max(cd->read_batch / 2, 6);
-		cd->write_batch = max(cd->write_batch / 2, 6);
+		cd->read_batch = max(cd->read_batch / 2, 4);
+		cd->write_batch = max(cd->write_batch / 2, 4);
 	}
 
-	/* Lưu lại giá trị hiện tại để phục hồi khi idle */
 	cd->saved_read_batch = cd->read_batch;
 	cd->saved_write_batch = cd->write_batch;
 	cd->saved_write_expire_ms = cd->write_expire_ms;
 
-	/* Clamp if eMMC */
 	cinnamon_clamp_for_emmc(cd);
 }
 
+/* Dispatch function with tiered priority, starvation avoidance, and background anti-starvation */
 static int cinnamon_dispatch(struct request_queue *q, int force)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
@@ -467,48 +582,71 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	int pressure = atomic_read(&cinnamon_io_pressure);
 	unsigned long write_expire_ns = cd->write_expire_ms * 1000000ULL;
 	unsigned long read_batch = cd->read_batch;
-	int dispatch_count = 0;
+	int prio, i;
+	int total_pending;
 
-	/* --- Starvation recovery check --- */
-	if (cd->starvation_recovery_until && time_after(jiffies, cd->starvation_recovery_until)) {
+	/* Starvation recovery check */
+	if (cd->starvation_recovery_until &&
+	    time_after(jiffies, cd->starvation_recovery_until)) {
 		cd->read_batch = cd->saved_read_batch_for_starve;
 		cd->starvation_recovery_until = 0;
 		cinnamon_clamp_for_emmc(cd);
 	}
 
-	/* Optimize: Cache expensive calculations based on pressure */
-	if (unlikely(pressure == 3)) {
-		write_expire_ns = 50 * 1000000ULL; /* Tighten for congestion */
-		read_batch = 32; /* Larger batch for boot/loading throughput */
-	} else if (pressure <= 1) {
-		write_expire_ns = 250 * 1000000ULL; /* Relax for read priority */
+	/* Dynamic expiration based on pressure and queue depth */
+	if (unlikely(pressure == 3))
+		write_expire_ns = 50 * 1000000ULL;
+	else if (pressure <= 1)
+		write_expire_ns = 250 * 1000000ULL;
+
+	if (cd->queue_counts[PRIO_WRITE_FG] + cd->queue_counts[PRIO_WRITE_BG] > 16)
+		write_expire_ns = 150 * 1000000ULL;
+
+	/* Anti-starvation for background: force a background request after too many foreground */
+	if (cd->fg_dispatch_count >= FG_STARVE_LIMIT) {
+		if (!list_empty(&cd->queues[PRIO_READ_BG])) {
+			rq = list_first_entry(&cd->queues[PRIO_READ_BG],
+					      struct request, queuelist);
+			target_pressure = 1;
+			cd->fg_dispatch_count = 0;
+			goto dispatch;
+		}
+		if (!list_empty(&cd->queues[PRIO_WRITE_BG])) {
+			rq = list_first_entry(&cd->queues[PRIO_WRITE_BG],
+					      struct request, queuelist);
+			target_pressure = 2;
+			cd->fg_dispatch_count = 0;
+			goto dispatch;
+		}
+		/* No background, reset counter anyway? Keep it? */
+		cd->fg_dispatch_count = 0;
 	}
 
-	/* Adaptive write_expire based on queue depth */
-	if (cd->write_cnt + cd->read_cnt > 32) {
-		write_expire_ns = 80 * 1000000ULL; /* Faster expire when queue is very full */
-	} else if (cd->write_cnt > 16) {
-		write_expire_ns = 150 * 1000000ULL; /* Moderate expire when write-heavy */
+	/* 1. Critical queue */
+	if (!list_empty(&cd->queues[PRIO_CRITICAL])) {
+		rq = list_first_entry(&cd->queues[PRIO_CRITICAL],
+				      struct request, queuelist);
+		target_pressure = 1;
+		cd->fg_dispatch_count++;
+		goto dispatch;
 	}
 
-	/* --- TRIM queue absolute priority --- */
-	if (!list_empty(&cd->trim_queue)) {
-		rq = list_first_entry(&cd->trim_queue, struct request, queuelist);
-		target_pressure = 0; /* TRIM doesn't affect pressure */
-		dispatch_count = 1;
-		goto dispatch_trim;
+	/* 2. TRIM queue */
+	if (!list_empty(&cd->queues[PRIO_TRIM])) {
+		rq = list_first_entry(&cd->queues[PRIO_TRIM],
+				      struct request, queuelist);
+		target_pressure = 0;
+		/* TRIM doesn't affect fg count */
+		goto dispatch;
 	}
 
-	/* Fast path: Check write starvation first (most critical) */
-	if (!list_empty(&cd->write_queue)) {
-		struct request *wrq = list_first_entry(&cd->write_queue, struct request, queuelist);
-		u64 req_time = get_req_time(wrq);
-		u64 wait_time = now_ns - req_time;
-
+	/* 3. Write starvation (foreground writes) */
+	if (!list_empty(&cd->queues[PRIO_WRITE_FG])) {
+		struct request *wrq = list_first_entry(&cd->queues[PRIO_WRITE_FG],
+							struct request, queuelist);
+		u64 wait_time = now_ns - get_req_time(wrq);
 		if (wait_time > write_expire_ns) {
-			/* Starvation detected */
 			if (wait_time > WRITE_STARVE_THRESH_NS) {
-				/* Severe starvation >300ms */
 				cd->write_starved_count++;
 				cd->last_starved_jiffies = jiffies;
 				if (!cd->starvation_recovery_until) {
@@ -519,188 +657,136 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 				}
 			}
 			rq = wrq;
-			target_pressure = 3; /* CONGESTED */
-			dispatch_count = 1;
-			goto dispatch_write;
+			target_pressure = 3;
+			cd->fg_dispatch_count++;
+			goto dispatch;
 		}
 	}
 
-	/* Priority for sync writes: if any sync write in queue, dispatch it immediately */
-	if (!list_empty(&cd->write_queue)) {
-		struct request *wrq;
-		list_for_each_entry(wrq, &cd->write_queue, queuelist) {
-			if (wrq->cmd_flags & REQ_SYNC) {
-				rq = wrq;
-				target_pressure = 2; /* WRITE BATCH (but expedited) */
-				dispatch_count = 1;
-				goto dispatch_write;
-			}
+	/* 4. eMMC sequential write boost */
+	if (cd->emmc_mode && cd->seq_write_count > 4) {
+		if (!list_empty(&cd->queues[PRIO_WRITE_FG])) {
+			rq = list_first_entry(&cd->queues[PRIO_WRITE_FG],
+					      struct request, queuelist);
+			target_pressure = 2;
+			cd->fg_dispatch_count++;
+			goto dispatch;
 		}
 	}
 
-	/* Normal priority dispatch */
-	if (!list_empty(&cd->read_queue)) {
-		if (cd->read_batch_count >= read_batch && !list_empty(&cd->write_queue)) {
-			rq = list_first_entry(&cd->write_queue, struct request, queuelist);
-			target_pressure = 2; /* WRITE BATCH */
+	/* 5. Normal interleaving: read_fg first, then write_fg if read batch exceeded */
+	if (!list_empty(&cd->queues[PRIO_READ_FG])) {
+		if (cd->read_batch_count >= read_batch &&
+		    !list_empty(&cd->queues[PRIO_WRITE_FG])) {
+			rq = list_first_entry(&cd->queues[PRIO_WRITE_FG],
+					      struct request, queuelist);
+			target_pressure = 2;
 			cd->read_batch_count = 0;
-			dispatch_count = 1;
-			goto dispatch_write;
+			cd->fg_dispatch_count++;
+			goto dispatch;
 		} else {
-			rq = list_first_entry(&cd->read_queue, struct request, queuelist);
-			target_pressure = 1; /* READ URGENT */
+			rq = list_first_entry(&cd->queues[PRIO_READ_FG],
+					      struct request, queuelist);
+			target_pressure = 1;
 			cd->read_batch_count++;
-			dispatch_count = 1;
-			goto dispatch_read;
+			cd->fg_dispatch_count++;
+			goto dispatch;
 		}
 	}
 
-	/* Write batching */
-	if (!list_empty(&cd->write_queue)) {
-		if (!list_empty(&cd->read_queue)) {
-			rq = list_first_entry(&cd->read_queue, struct request, queuelist);
-			target_pressure = 1; /* READ URGENT */
-			cd->read_batch_count++;
-			dispatch_count = 1;
-			goto dispatch_read;
-		} else {
-			rq = list_first_entry(&cd->write_queue, struct request, queuelist);
-			
-			if (cd->batch_count < cd->write_batch) {
-				cd->batch_count++;
-				target_pressure = 2; /* WRITE BATCH */
-			} else {
-				cd->batch_count = 0;
-				target_pressure = 2;
-			}
-			dispatch_count = 1;
-			goto dispatch_write;
-		}
+	/* 6. Foreground writes (if no reads) */
+	if (!list_empty(&cd->queues[PRIO_WRITE_FG])) {
+		rq = list_first_entry(&cd->queues[PRIO_WRITE_FG],
+				      struct request, queuelist);
+		target_pressure = 2;
+		cd->fg_dispatch_count++;
+		goto dispatch;
 	}
 
-	/* No requests to dispatch */
-	{
-		cd->empty_dispatch_count++;
+	/* 7. Background reads */
+	if (!list_empty(&cd->queues[PRIO_READ_BG])) {
+		rq = list_first_entry(&cd->queues[PRIO_READ_BG],
+				      struct request, queuelist);
+		target_pressure = 1;
+		cd->read_batch_count++;
+		cd->fg_dispatch_count = 0;  /* reset on background */
+		goto dispatch;
+	}
 
-		cinnamon_set_pressure(cd, q, 0);
+	/* 8. Background writes */
+	if (!list_empty(&cd->queues[PRIO_WRITE_BG])) {
+		rq = list_first_entry(&cd->queues[PRIO_WRITE_BG],
+				      struct request, queuelist);
+		target_pressure = 2;
+		cd->fg_dispatch_count = 0;
+		goto dispatch;
+	}
 
-		/* Only adjust params every 100 empty dispatches */
-		if ((cd->empty_dispatch_count % 100) == 0)
-			cinnamon_adjust_params(cd, q);
-		
-		/* Only update read-ahead every 50 empty dispatches */
-		if ((cd->empty_dispatch_count % 50) == 0) {
-			if (cd->predicted_sector != 0 && cd->read_cnt == 0 && list_empty(&cd->read_queue)) {
-				unsigned long current_ra = q->backing_dev_info.ra_pages;
-				unsigned long max_ra = min(current_ra * 2, 256UL);
-				unsigned long new_ra = clamp(current_ra + 16, 16UL, max_ra);
-				
-				if (cd->last_read_direction != 0 && abs(cd->last_read_direction) == 1)
-					q->backing_dev_info.ra_pages = new_ra;
-			} else if (q->backing_dev_info.ra_pages > 64) {
-				q->backing_dev_info.ra_pages = 64;
-			}
+	/* No requests */
+	cd->empty_dispatch_count++;
+	cinnamon_set_pressure(cd, 0);
+
+	if ((cd->empty_dispatch_count % 100) == 0)
+		cinnamon_adjust_params(cd);
+
+	/* Idle read-ahead adjustments */
+	if ((cd->empty_dispatch_count % 50) == 0) {
+		if (cd->predicted_sector != 0 &&
+		    cd->queue_counts[PRIO_READ_FG] == 0 &&
+		    cd->queue_counts[PRIO_READ_BG] == 0) {
+			unsigned long current_ra = cd->q->backing_dev_info.ra_pages;
+			unsigned long max_ra = min(current_ra * 2, 256UL);
+			unsigned long new_ra = clamp(current_ra + 16, 16UL, max_ra);
+			if (cd->last_read_direction != 0)
+				cd->q->backing_dev_info.ra_pages = new_ra;
+		} else if (cd->q->backing_dev_info.ra_pages > 64) {
+			cd->q->backing_dev_info.ra_pages = 64;
 		}
 	}
 	return 0;
 
-dispatch_trim:
+dispatch:
 	if (rq) {
-		if (cd->trim_cnt > 0)
-			cd->trim_cnt--;
-		list_del_init(&rq->queuelist);
-		/* No latency tracking for TRIM (optional) */
-		set_req_time(rq, 0);
-		elv_dispatch_sort(q, rq);
-		return 1;
-	}
-	return 0;
+		/* Decrement count for the queue this request belongs to */
+		prio = get_req_prio(rq);
+		if (prio >= 0 && prio < PRIO_COUNT && cd->queue_counts[prio] > 0)
+			cd->queue_counts[prio]--;
 
-dispatch_read:
-	if (rq) {
-		if (cd->read_cnt > 0)
-			cd->read_cnt--;
 		list_del_init(&rq->queuelist);
 
-		/* Latency tracking with ns */
-		if ((dispatch_count % 8) == 0) {
-			u64 current_latency = now_ns - get_req_time(rq);
-			u64 old_avg = atomic64_read(&cd->total_latency_ns);
-			int old_count = atomic_read(&cd->num_requests);
-			
-			if (old_count > 0) {
-				atomic64_set(&cd->total_latency_ns, (old_avg * 7 + current_latency * 3) / 10);
-			} else {
-				atomic64_set(&cd->total_latency_ns, current_latency);
-			}
-			
-			if (old_count < 100)
-				atomic_set(&cd->num_requests, old_count + 1);
+		/* Latency tracking */
+		if ((cd->dispatch_seq % ((rq_data_dir(rq) == READ) ? 8 : 16)) == 0) {
+			u64 lat = now_ns - get_req_time(rq);
+			cinnamon_update_latency(cd, lat);
+		}
+
+		/* Update history */
+		if ((cd->dispatch_seq++ % 4) == 0) {
+			if (rq_data_dir(rq) == READ)
+				cinnamon_update_read_history(cd, blk_rq_pos(rq));
 			else
-				atomic_set(&cd->num_requests, old_count / 2);
+				cinnamon_update_write_history(cd, blk_rq_pos(rq));
 		}
 
-		/* Update read history periodically */
-		if ((cd->dispatch_seq++ % 4) == 0)
-			cinnamon_update_read_history(cd, blk_rq_pos(rq));
+		/* Clear timestamp (optional) */
+		set_req_time_and_prio(rq, 0, 0);
 
-		set_req_time(rq, 0);
-		cd->batch_count = 0;
+		/* Update batching counters */
+		cd->batch_count = (target_pressure == 2) ? cd->batch_count + 1 : 0;
+		if (target_pressure == 1)
+			cd->read_batch_count++;
+		else
+			cd->read_batch_count = 0;
+
+		/* Update pressure if needed */
+		total_pending = 0;
+		for (i = 0; i < PRIO_COUNT; i++)
+			total_pending += cd->queue_counts[i];
+		if (total_pending > cd->pressure_thres)
+			target_pressure = 3;
 
 		if (target_pressure != atomic_read(&cinnamon_io_pressure))
-			cinnamon_set_pressure(cd, q, target_pressure);
-
-		elv_dispatch_sort(q, rq);
-		return 1;
-	}
-	return 0;
-
-dispatch_write:
-	if (rq) {
-		if (cd->write_cnt > 0)
-			cd->write_cnt--;
-		list_del_init(&rq->queuelist);
-
-		/* Latency tracking for writes */
-		if ((dispatch_count % 16) == 0) {
-			u64 current_latency = now_ns - get_req_time(rq);
-			u64 old_avg = atomic64_read(&cd->total_latency_ns);
-			int old_count = atomic_read(&cd->num_requests);
-			
-			if (old_count > 0) {
-				atomic64_set(&cd->total_latency_ns, (old_avg * 7 + current_latency * 3) / 10);
-			} else {
-				atomic64_set(&cd->total_latency_ns, current_latency);
-			}
-			
-			if (old_count < 100)
-				atomic_set(&cd->num_requests, old_count + 1);
-			else
-				atomic_set(&cd->num_requests, old_count / 2);
-		}
-
-		/* Update write history periodically */
-		if ((cd->dispatch_seq++ % 4) == 0)
-			cinnamon_update_write_history(cd, blk_rq_pos(rq));
-
-		set_req_time(rq, 0);
-		cd->read_batch_count = 0;
-
-		/* Boost batch if sequential write predicted */
-		if (cd->predicted_write_sector != 0 && cd->last_write_direction != 0) {
-			/* Allow larger batch for this dispatch */
-			cd->batch_count = 0; /* Reset to allow more writes? Actually we just let it continue */
-			/* No change needed, but we could temporarily increase write_batch */
-			/* For simplicity, we just note the prediction and rely on existing batch */
-		}
-
-		/* Pressure check */
-		if ((cd->write_cnt + cd->read_cnt) > cd->pressure_thres) {
-			if (atomic_read(&cinnamon_io_pressure) != 3)
-				cinnamon_set_pressure(cd, q, 3);
-		} else if (target_pressure != atomic_read(&cinnamon_io_pressure)) {
-			cinnamon_set_pressure(cd, q, target_pressure);
-		}
+			cinnamon_set_pressure(cd, target_pressure);
 
 		elv_dispatch_sort(q, rq);
 		return 1;
@@ -708,42 +794,19 @@ dispatch_write:
 	return 0;
 }
 
-static void cinnamon_add_request(struct request_queue *q, struct request *rq)
-{
-	struct cinnamon_data *cd = q->elevator->elevator_data;
-
-	set_req_time(rq, ktime_to_ns(ktime_get()));
-
-	if (rq->cmd_flags & REQ_DISCARD) {
-		/* TRIM requests go to dedicated queue */
-		list_add_tail(&rq->queuelist, &cd->trim_queue);
-		cd->trim_cnt++;
-	} else if (rq_data_dir(rq) == READ) {
-		/* Sync reads go to front */
-		if (rq->cmd_flags & REQ_SYNC)
-			list_add(&rq->queuelist, &cd->read_queue);
-		else
-			list_add_tail(&rq->queuelist, &cd->read_queue);
-		cd->read_cnt++;
-	} else {
-		/* Sync writes go to front */
-		if (rq->cmd_flags & REQ_SYNC)
-			list_add(&rq->queuelist, &cd->write_queue);
-		else
-			list_add_tail(&rq->queuelist, &cd->write_queue);
-		cd->write_cnt++;
-	}
-}
-
+/* Former/latter request functions - optimized using stored priority */
 static struct request *
 cinnamon_former_request(struct request_queue *q, struct request *rq)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
+	int prio = get_req_prio(rq);
 
-	if (rq->queuelist.prev == &cd->read_queue ||
-	    rq->queuelist.prev == &cd->write_queue ||
-	    rq->queuelist.prev == &cd->trim_queue)
+	if (prio < 0 || prio >= PRIO_COUNT)
 		return NULL;
+
+	if (rq->queuelist.prev == &cd->queues[prio])
+		return NULL;
+
 	return list_entry(rq->queuelist.prev, struct request, queuelist);
 }
 
@@ -751,18 +814,23 @@ static struct request *
 cinnamon_latter_request(struct request_queue *q, struct request *rq)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
+	int prio = get_req_prio(rq);
 
-	if (rq->queuelist.next == &cd->read_queue ||
-	    rq->queuelist.next == &cd->write_queue ||
-	    rq->queuelist.next == &cd->trim_queue)
+	if (prio < 0 || prio >= PRIO_COUNT)
 		return NULL;
+
+	if (rq->queuelist.next == &cd->queues[prio])
+		return NULL;
+
 	return list_entry(rq->queuelist.next, struct request, queuelist);
 }
 
+/* Initialize queue */
 static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 {
 	struct cinnamon_data *cd;
 	struct elevator_queue *eq;
+	int i;
 
 	eq = elevator_alloc(q, e);
 	if (!eq)
@@ -774,60 +842,59 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 		return -ENOMEM;
 	}
 
-	INIT_LIST_HEAD(&cd->read_queue);
-	INIT_LIST_HEAD(&cd->write_queue);
-	INIT_LIST_HEAD(&cd->trim_queue);
+	for (i = 0; i < PRIO_COUNT; i++) {
+		INIT_LIST_HEAD(&cd->queues[i]);
+		cd->queue_counts[i] = 0;
+	}
+
 	cd->batch_count = 0;
-	cd->write_cnt = 0;
-	cd->read_cnt = 0;
-	cd->trim_cnt = 0;
 	cd->read_batch_count = 0;
+	cd->fg_dispatch_count = 0;
 	atomic64_set(&cd->total_latency_ns, 0);
 	atomic_set(&cd->num_requests, 0);
 	cd->last_ra_pressure = -1;
 	cd->last_pressure_change_jiffies = 0;
+	cd->last_manual_param_change_jiffies = jiffies;
 	cd->write_expire_ms = CINNAMON_WRITE_EXPIRE;
 	cd->read_batch = CINNAMON_READ_BATCH;
 	cd->write_batch = CINNAMON_WRITE_BATCH;
 	cd->pressure_thres = CINNAMON_PRESSURE_THRES;
 	cd->hysteresis_ms = CINNAMON_HYSTERESIS_MS;
-	/* Read prediction */
+
 	cd->history_index = 0;
 	cd->history_count = 0;
 	cd->last_read_direction = 0;
 	cd->predicted_sector = 0;
-	/* Write prediction */
+
 	cd->write_history_index = 0;
 	cd->write_history_count = 0;
 	cd->last_write_direction = 0;
 	cd->predicted_write_sector = 0;
-	/* Adaptive */
+	cd->seq_write_count = 0;
+	cd->last_write_sector = 0;
+
 	cd->last_adjust_jiffies = jiffies;
 	cd->target_latency_ms = CINNAMON_TARGET_LATENCY_MS;
 	cd->adjust_interval_ms = CINNAMON_ADJUST_INTERVAL_MS;
 	cd->saved_read_batch = cd->read_batch;
 	cd->saved_write_batch = cd->write_batch;
 	cd->saved_write_expire_ms = cd->write_expire_ms;
-	cd->last_manual_param_change_jiffies = jiffies;
+
 	cd->q = q;
 	cd->dispatch_seq = 0;
 	cd->empty_dispatch_count = 0;
 
-	/* --- Starvation fields init --- */
 	cd->write_starved_count = 0;
 	cd->last_starved_jiffies = 0;
 	cd->starvation_recovery_until = 0;
 	cd->saved_read_batch_for_starve = 0;
 
-	/* Detect eMMC based on backing device's device major */
 	cd->emmc_mode = false;
 	if (q->backing_dev_info.dev) {
 		dev_t devt = q->backing_dev_info.dev->devt;
 		if (MAJOR(devt) == EMMC_MAJOR)
 			cd->emmc_mode = true;
 	}
-
-	/* Clamp initial values if eMMC */
 	cinnamon_clamp_for_emmc(cd);
 
 	eq->elevator_data = cd;
@@ -841,16 +908,15 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 static void cinnamon_exit_queue(struct elevator_queue *e)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	
-	WARN_ON(!list_empty(&cd->read_queue));
-	WARN_ON(!list_empty(&cd->write_queue));
-	WARN_ON(!list_empty(&cd->trim_queue));
+	int i;
+
+	for (i = 0; i < PRIO_COUNT; i++)
+		WARN_ON(!list_empty(&cd->queues[i]));
 
 	kfree(cd);
 }
 
-/* Sysfs attributes */
-
+/* Sysfs attributes (unchanged except for adding fg_dispatch_count maybe) */
 static ssize_t cinnamon_pressure_show(struct elevator_queue *e, char *page)
 {
 	return sprintf(page, "%d\n", atomic_read(&cinnamon_io_pressure));
@@ -859,11 +925,8 @@ static ssize_t cinnamon_pressure_show(struct elevator_queue *e, char *page)
 static ssize_t cinnamon_avg_latency_ns_show(struct elevator_queue *e, char *page)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	u64 total_ns;
-	int num;
-
-	total_ns = atomic64_read(&cd->total_latency_ns);
-	num = atomic_read(&cd->num_requests);
+	u64 total_ns = atomic64_read(&cd->total_latency_ns);
+	int num = atomic_read(&cd->num_requests);
 	if (num == 0)
 		return sprintf(page, "0\n");
 	return sprintf(page, "%llu\n", (unsigned long long)div64_u64(total_ns, num));
@@ -878,13 +941,12 @@ static ssize_t cinnamon_write_expire_ms_show(struct elevator_queue *e, char *pag
 static ssize_t cinnamon_write_expire_ms_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	long val = simple_strtol(page, NULL, 10);
-	if (val > 0) {
-		cd->write_expire_ms = val;
-		cd->last_manual_param_change_jiffies = jiffies;
-		return count;
-	}
-	return -EINVAL;
+	long val;
+	if (kstrtol(page, 10, &val) || val <= 0)
+		return -EINVAL;
+	cd->write_expire_ms = val;
+	cd->last_manual_param_change_jiffies = jiffies;
+	return count;
 }
 
 static ssize_t cinnamon_read_batch_show(struct elevator_queue *e, char *page)
@@ -896,14 +958,13 @@ static ssize_t cinnamon_read_batch_show(struct elevator_queue *e, char *page)
 static ssize_t cinnamon_read_batch_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	long val = simple_strtol(page, NULL, 10);
-	if (val > 0) {
-		cd->read_batch = val;
-		cinnamon_clamp_for_emmc(cd);
-		cd->last_manual_param_change_jiffies = jiffies;
-		return count;
-	}
-	return -EINVAL;
+	long val;
+	if (kstrtol(page, 10, &val) || val <= 0)
+		return -EINVAL;
+	cd->read_batch = val;
+	cinnamon_clamp_for_emmc(cd);
+	cd->last_manual_param_change_jiffies = jiffies;
+	return count;
 }
 
 static ssize_t cinnamon_write_batch_show(struct elevator_queue *e, char *page)
@@ -915,14 +976,13 @@ static ssize_t cinnamon_write_batch_show(struct elevator_queue *e, char *page)
 static ssize_t cinnamon_write_batch_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	long val = simple_strtol(page, NULL, 10);
-	if (val > 0) {
-		cd->write_batch = val;
-		cinnamon_clamp_for_emmc(cd);
-		cd->last_manual_param_change_jiffies = jiffies;
-		return count;
-	}
-	return -EINVAL;
+	long val;
+	if (kstrtol(page, 10, &val) || val <= 0)
+		return -EINVAL;
+	cd->write_batch = val;
+	cinnamon_clamp_for_emmc(cd);
+	cd->last_manual_param_change_jiffies = jiffies;
+	return count;
 }
 
 static ssize_t cinnamon_pressure_thres_show(struct elevator_queue *e, char *page)
@@ -934,14 +994,13 @@ static ssize_t cinnamon_pressure_thres_show(struct elevator_queue *e, char *page
 static ssize_t cinnamon_pressure_thres_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	long val = simple_strtol(page, NULL, 10);
-	if (val >= 0) {
-		cd->pressure_thres = val;
-		cinnamon_clamp_for_emmc(cd);
-		cd->last_manual_param_change_jiffies = jiffies;
-		return count;
-	}
-	return -EINVAL;
+	long val;
+	if (kstrtol(page, 10, &val) || val < 0)
+		return -EINVAL;
+	cd->pressure_thres = val;
+	cinnamon_clamp_for_emmc(cd);
+	cd->last_manual_param_change_jiffies = jiffies;
+	return count;
 }
 
 static ssize_t cinnamon_hysteresis_ms_show(struct elevator_queue *e, char *page)
@@ -953,13 +1012,12 @@ static ssize_t cinnamon_hysteresis_ms_show(struct elevator_queue *e, char *page)
 static ssize_t cinnamon_hysteresis_ms_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	long val = simple_strtol(page, NULL, 10);
-	if (val > 0) {
-		cd->hysteresis_ms = val;
-		cd->last_manual_param_change_jiffies = jiffies;
-		return count;
-	}
-	return -EINVAL;
+	long val;
+	if (kstrtol(page, 10, &val) || val <= 0)
+		return -EINVAL;
+	cd->hysteresis_ms = val;
+	cd->last_manual_param_change_jiffies = jiffies;
+	return count;
 }
 
 static ssize_t cinnamon_target_latency_ms_show(struct elevator_queue *e, char *page)
@@ -971,13 +1029,12 @@ static ssize_t cinnamon_target_latency_ms_show(struct elevator_queue *e, char *p
 static ssize_t cinnamon_target_latency_ms_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	long val = simple_strtol(page, NULL, 10);
-	if (val > 0) {
-		cd->target_latency_ms = val;
-		cd->last_manual_param_change_jiffies = jiffies;
-		return count;
-	}
-	return -EINVAL;
+	long val;
+	if (kstrtol(page, 10, &val) || val <= 0)
+		return -EINVAL;
+	cd->target_latency_ms = val;
+	cd->last_manual_param_change_jiffies = jiffies;
+	return count;
 }
 
 static ssize_t cinnamon_adjust_interval_ms_show(struct elevator_queue *e, char *page)
@@ -989,13 +1046,12 @@ static ssize_t cinnamon_adjust_interval_ms_show(struct elevator_queue *e, char *
 static ssize_t cinnamon_adjust_interval_ms_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	long val = simple_strtol(page, NULL, 10);
-	if (val >= 100) {
-		cd->adjust_interval_ms = val;
-		cd->last_manual_param_change_jiffies = jiffies;
-		return count;
-	}
-	return -EINVAL;
+	long val;
+	if (kstrtol(page, 10, &val) || val < 100)
+		return -EINVAL;
+	cd->adjust_interval_ms = val;
+	cd->last_manual_param_change_jiffies = jiffies;
+	return count;
 }
 
 static ssize_t cinnamon_predicted_sector_show(struct elevator_queue *e, char *page)
@@ -1025,8 +1081,16 @@ static ssize_t cinnamon_ra_pages_show(struct elevator_queue *e, char *page)
 static ssize_t cinnamon_batch_stats_show(struct elevator_queue *e, char *page)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	return sprintf(page, "read_batch_count: %u\nbatch_count: %u\nread_cnt: %d\nwrite_cnt: %d\ntrim_cnt: %d\n",
-		       cd->read_batch_count, cd->batch_count, cd->read_cnt, cd->write_cnt, cd->trim_cnt);
+	return sprintf(page,
+		"read_batch_count: %u\nbatch_count: %u\nfg_dispatch: %u\n"
+		"critical: %d\ntrim: %d\nread_fg: %d\nwrite_fg: %d\nread_bg: %d\nwrite_bg: %d\n",
+		cd->read_batch_count, cd->batch_count, cd->fg_dispatch_count,
+		cd->queue_counts[PRIO_CRITICAL],
+		cd->queue_counts[PRIO_TRIM],
+		cd->queue_counts[PRIO_READ_FG],
+		cd->queue_counts[PRIO_WRITE_FG],
+		cd->queue_counts[PRIO_READ_BG],
+		cd->queue_counts[PRIO_WRITE_BG]);
 }
 
 static ssize_t cinnamon_emmc_mode_show(struct elevator_queue *e, char *page)
@@ -1038,26 +1102,21 @@ static ssize_t cinnamon_emmc_mode_show(struct elevator_queue *e, char *page)
 static ssize_t cinnamon_emmc_mode_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	long val = simple_strtol(page, NULL, 10);
-	bool new_mode = (val != 0);
-
-	if (cd->emmc_mode != new_mode) {
-		cd->emmc_mode = new_mode;
-		/* Re-clamp current values */
-		cinnamon_clamp_for_emmc(cd);
-		cd->last_manual_param_change_jiffies = jiffies;
-	}
+	long val;
+	if (kstrtol(page, 10, &val))
+		return -EINVAL;
+	cd->emmc_mode = (val != 0);
+	cinnamon_clamp_for_emmc(cd);
+	cd->last_manual_param_change_jiffies = jiffies;
 	return count;
 }
 
-/* sysfs entry for trim count */
 static ssize_t cinnamon_trim_cnt_show(struct elevator_queue *e, char *page)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	return sprintf(page, "%d\n", cd->trim_cnt);
+	return sprintf(page, "%d\n", cd->queue_counts[PRIO_TRIM]);
 }
 
-/* --- Starvation sysfs entries --- */
 static ssize_t cinnamon_starvation_count_show(struct elevator_queue *e, char *page)
 {
 	struct cinnamon_data *cd = e->elevator_data;
@@ -1087,7 +1146,6 @@ static struct elv_fs_entry cinnamon_attrs[] = {
 	__ATTR(batch_stats, 0444, cinnamon_batch_stats_show, NULL),
 	__ATTR(emmc_mode, 0644, cinnamon_emmc_mode_show, cinnamon_emmc_mode_store),
 	__ATTR(trim_cnt, 0444, cinnamon_trim_cnt_show, NULL),
-	/* Starvation attributes */
 	__ATTR(starvation_count, 0444, cinnamon_starvation_count_show, NULL),
 	__ATTR(last_starved, 0444, cinnamon_last_starved_show, NULL),
 	__ATTR_NULL
