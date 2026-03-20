@@ -18,6 +18,13 @@ MAKEFLAGS += -rR --no-print-directory
 
 # Avoid funny character set dependencies
 unexport LC_ALL
+
+# Fix LTO/SME warnings without disabling LTO
+KBUILD_CFLAGS += -fno-ipa-sra -fno-strict-aliasing -fno-toplevel-reorder -fno-ipa-cp-clone -fno-tree-loop-distribute-patterns -ffunction-sections -fdata-sections
+KBUILD_LDFLAGS += --gc-sections
+# Fix LTO section alignment issues
+KBUILD_CFLAGS += -fno-common -fmerge-all-constants
+LDFLAGS_vmlinux += --orphan-handling=warn
 LC_COLLATE=C
 LC_NUMERIC=C
 export LC_COLLATE LC_NUMERIC
