@@ -106,6 +106,11 @@ static bool online_core;
 static bool cluster_info_probed;
 static bool cluster_info_nodes_called;
 static int *tsens_id_map;
+
+/* Cinnamon Priority Cores - Keep primary core at higher frequency under thermal stress */
+static bool priority_cores_enabled = true;
+static int priority_core_id = 0;
+static int priority_core_temp_offset = 8; /* 8°C higher threshold for priority core */
 static DEFINE_MUTEX(vdd_rstr_mutex);
 static DEFINE_MUTEX(psm_mutex);
 static DEFINE_MUTEX(cx_mutex);
@@ -122,6 +127,8 @@ static struct kobj_attribute mx_enabled_attr;
 static struct attribute_group cx_attr_gp;
 static struct attribute_group gfx_attr_gp;
 static struct attribute_group mx_attr_group;
+static struct kobject *priority_cores_kobj;
+static struct attribute_group priority_cores_attr_group;
 static struct regulator *vdd_mx;
 static struct cpufreq_frequency_table *pending_freq_table_ptr;
 static int pending_cpu_freq = -1;
@@ -2619,47 +2626,173 @@ exit:
 static void do_freq_control(long temp)
 {
 	uint32_t cpu = 0;
-	uint32_t max_freq = cpus[cpu].limited_max_freq;
+	uint32_t max_freq = UINT_MAX;
+	uint32_t priority_max_freq = UINT_MAX;
+	uint32_t new_freq;
+	bool freq_changed = false;
+	bool priority_core_valid = false;
 
 	if (core_ptr)
 		return do_cluster_freq_ctrl(temp);
 	if (!freq_table_get)
 		return;
 
-	if (temp >= msm_thermal_info.limit_temp_degC) {
-		if (limit_idx == limit_idx_low)
-			return;
-
-		limit_idx -= msm_thermal_info.bootup_freq_step;
-		if (limit_idx < limit_idx_low)
-			limit_idx = limit_idx_low;
-		max_freq = table[limit_idx].frequency;
-	} else if (temp < msm_thermal_info.limit_temp_degC -
-		 msm_thermal_info.temp_hysteresis_degC) {
-		if (limit_idx == limit_idx_high)
-			return;
-
-		limit_idx += msm_thermal_info.bootup_freq_step;
-		if (limit_idx >= limit_idx_high) {
-			limit_idx = limit_idx_high;
-			max_freq = UINT_MAX;
-		} else
-			max_freq = table[limit_idx].frequency;
+	/* Cinnamon Priority Cores: Validate priority core is in control mask */
+	if (priority_cores_enabled) {
+		if (msm_thermal_info.bootup_freq_control_mask & BIT(priority_core_id)) {
+			priority_core_valid = true;
+		} else {
+			pr_warn_once("Cinnamon Priority Cores: CPU%d not in freq control mask, disabling\n",
+				priority_core_id);
+			priority_cores_enabled = false;
+		}
 	}
 
-	if (max_freq == cpus[cpu].limited_max_freq)
+	/* Safety check: bootup_freq_step must be non-zero */
+	if (msm_thermal_info.bootup_freq_step == 0) {
+		pr_warn_once("Cinnamon Priority Cores: bootup_freq_step is 0, throttling disabled\n");
 		return;
+	}
+
+	/* Safety check: frequency table bounds */
+	if (limit_idx_low < 0 || limit_idx_high < 0 || limit_idx_low > limit_idx_high) {
+		pr_err("Cinnamon Priority Cores: Invalid limit indices low=%d high=%d\n",
+			limit_idx_low, limit_idx_high);
+		return;
+	}
+
+	/* Cinnamon Priority Cores: Calculate separate limits for priority vs secondary cores */
+	if (priority_cores_enabled && priority_core_valid) {
+		long priority_temp_threshold = msm_thermal_info.limit_temp_degC + priority_core_temp_offset;
+		
+		/* Calculate limit for secondary cores (standard throttling) */
+		if (temp >= msm_thermal_info.limit_temp_degC) {
+			if (limit_idx > limit_idx_low) {
+				limit_idx -= msm_thermal_info.bootup_freq_step;
+				if (limit_idx < limit_idx_low)
+					limit_idx = limit_idx_low;
+				/* Safety: ensure table entry exists */
+				if (table[limit_idx].frequency != CPUFREQ_ENTRY_INVALID)
+					max_freq = table[limit_idx].frequency;
+				else
+					max_freq = UINT_MAX;
+				freq_changed = true;
+			} else {
+				if (table[limit_idx].frequency != CPUFREQ_ENTRY_INVALID)
+					max_freq = table[limit_idx].frequency;
+				else
+					max_freq = UINT_MAX;
+			}
+		} else if (temp < msm_thermal_info.limit_temp_degC -
+			 msm_thermal_info.temp_hysteresis_degC) {
+			if (limit_idx < limit_idx_high) {
+				limit_idx += msm_thermal_info.bootup_freq_step;
+				if (limit_idx >= limit_idx_high) {
+					limit_idx = limit_idx_high;
+					max_freq = UINT_MAX;
+				} else {
+					if (table[limit_idx].frequency != CPUFREQ_ENTRY_INVALID)
+						max_freq = table[limit_idx].frequency;
+					else
+						max_freq = UINT_MAX;
+				}
+				freq_changed = true;
+			} else {
+				max_freq = UINT_MAX;
+			}
+		} else {
+			/* Within hysteresis - keep current limit */
+			if (table[limit_idx].frequency != CPUFREQ_ENTRY_INVALID)
+				max_freq = table[limit_idx].frequency;
+			else
+				max_freq = UINT_MAX;
+		}
+
+		/* Calculate limit for priority core (higher threshold) */
+		if (temp >= priority_temp_threshold) {
+			/* Priority core throttles at higher temp - use less aggressive limit */
+			int priority_limit_idx = limit_idx + msm_thermal_info.bootup_freq_step;
+			if (priority_limit_idx > limit_idx_high)
+				priority_limit_idx = limit_idx_high;
+			if (priority_limit_idx < limit_idx_low)
+				priority_limit_idx = limit_idx_low;
+			
+			if (priority_limit_idx == limit_idx_high)
+				priority_max_freq = UINT_MAX;
+			else if (table[priority_limit_idx].frequency != CPUFREQ_ENTRY_INVALID)
+				priority_max_freq = table[priority_limit_idx].frequency;
+			else
+				priority_max_freq = UINT_MAX;
+		} else {
+			/* Priority core below threshold - no throttling */
+			priority_max_freq = UINT_MAX;
+		}
+	} else {
+		/* Standard behavior: all cores throttled equally */
+		if (temp >= msm_thermal_info.limit_temp_degC) {
+			if (limit_idx > limit_idx_low) {
+				limit_idx -= msm_thermal_info.bootup_freq_step;
+				if (limit_idx < limit_idx_low)
+					limit_idx = limit_idx_low;
+				if (table[limit_idx].frequency != CPUFREQ_ENTRY_INVALID)
+					max_freq = table[limit_idx].frequency;
+				else
+					max_freq = UINT_MAX;
+				freq_changed = true;
+			} else {
+				if (table[limit_idx].frequency != CPUFREQ_ENTRY_INVALID)
+					max_freq = table[limit_idx].frequency;
+				else
+					max_freq = UINT_MAX;
+			}
+		} else if (temp < msm_thermal_info.limit_temp_degC -
+			 msm_thermal_info.temp_hysteresis_degC) {
+			if (limit_idx < limit_idx_high) {
+				limit_idx += msm_thermal_info.bootup_freq_step;
+				if (limit_idx >= limit_idx_high) {
+					limit_idx = limit_idx_high;
+					max_freq = UINT_MAX;
+				} else {
+					if (table[limit_idx].frequency != CPUFREQ_ENTRY_INVALID)
+						max_freq = table[limit_idx].frequency;
+					else
+						max_freq = UINT_MAX;
+				}
+				freq_changed = true;
+			} else {
+				max_freq = UINT_MAX;
+			}
+		} else {
+			return; /* No change needed */
+		}
+	}
 
 	/* Update new limits */
 	get_online_cpus();
 	for_each_possible_cpu(cpu) {
 		if (!(msm_thermal_info.bootup_freq_control_mask & BIT(cpu)))
 			continue;
-		pr_info("Limiting CPU%d max frequency to %u. Temp:%ld\n",
-			cpu, max_freq, temp);
-		cpus[cpu].limited_max_freq = max_freq;
-		if (!SYNC_CORE(cpu))
-			update_cpu_freq(cpu);
+		
+		/* Cinnamon Priority Cores: Apply different limits based on core */
+		if (priority_cores_enabled && priority_core_valid && cpu == priority_core_id) {
+			new_freq = priority_max_freq;
+			if (new_freq != cpus[cpu].limited_max_freq) {
+				pr_info("Cinnamon Priority Core: CPU%d max frequency to %u. Temp:%ld (priority)\n",
+					cpu, new_freq, temp);
+				cpus[cpu].limited_max_freq = new_freq;
+				if (!SYNC_CORE(cpu))
+					update_cpu_freq(cpu);
+			}
+		} else {
+			new_freq = max_freq;
+			if (new_freq != cpus[cpu].limited_max_freq) {
+				pr_info("Limiting CPU%d max frequency to %u. Temp:%ld\n",
+					cpu, new_freq, temp);
+				cpus[cpu].limited_max_freq = new_freq;
+				if (!SYNC_CORE(cpu))
+					update_cpu_freq(cpu);
+			}
+		}
 	}
 	update_cluster_freq();
 	put_online_cpus();
@@ -3873,11 +4006,112 @@ static struct kernel_param_ops module_ops = {
 module_param_cb(enabled, &module_ops, &enabled, 0644);
 MODULE_PARM_DESC(enabled, "enforce thermal limit on cpu");
 
+/* Cinnamon Priority Cores sysfs functions */
+static ssize_t show_priority_cores_enabled(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", priority_cores_enabled);
+}
+
+static ssize_t store_priority_cores_enabled(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int ret = 0;
+	int val = 0;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret) {
+		pr_err("Invalid input %s. err:%d\n", buf, ret);
+		return ret;
+	}
+
+	priority_cores_enabled = !!val;
+	pr_info("Cinnamon Priority Cores %s\n", priority_cores_enabled ? "enabled" : "disabled");
+	return count;
+}
+
+static ssize_t show_priority_core_id(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", priority_core_id);
+}
+
+static ssize_t store_priority_core_id(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int ret = 0;
+	int val = 0;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret) {
+		pr_err("Invalid input %s. err:%d\n", buf, ret);
+		return ret;
+	}
+
+	if (val < 0 || val >= 4) {
+		pr_err("Invalid core ID %d. Must be 0-3\n", val);
+		return -EINVAL;
+	}
+
+	priority_core_id = val;
+	pr_info("Cinnamon Priority Core set to CPU%d\n", priority_core_id);
+	return count;
+}
+
+static ssize_t show_priority_core_temp_offset(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", priority_core_temp_offset);
+}
+
+static ssize_t store_priority_core_temp_offset(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int ret = 0;
+	int val = 0;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret) {
+		pr_err("Invalid input %s. err:%d\n", buf, ret);
+		return ret;
+	}
+
+	if (val < 0 || val > 20) {
+		pr_err("Invalid temp offset %d. Must be 0-20°C\n", val);
+		return -EINVAL;
+	}
+
+	priority_core_temp_offset = val;
+	pr_info("Cinnamon Priority Core temp offset set to %d°C\n", priority_core_temp_offset);
+	return count;
+}
+
 static ssize_t show_cc_enabled(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
 	return snprintf(buf, PAGE_SIZE, "%d\n", core_control_enabled);
 }
+
+/* Cinnamon Priority Cores sysfs attributes */
+static struct kobj_attribute priority_cores_enabled_attr =
+	__ATTR(enabled, 0644, show_priority_cores_enabled, store_priority_cores_enabled);
+
+static struct kobj_attribute priority_core_id_attr =
+	__ATTR(core_id, 0644, show_priority_core_id, store_priority_core_id);
+
+static struct kobj_attribute priority_core_temp_offset_attr =
+	__ATTR(temp_offset, 0644, show_priority_core_temp_offset, store_priority_core_temp_offset);
+
+static struct attribute *priority_cores_attrs[] = {
+	&priority_cores_enabled_attr.attr,
+	&priority_core_id_attr.attr,
+	&priority_core_temp_offset_attr.attr,
+	NULL,
+};
+
+static struct attribute_group priority_cores_attr_group = {
+	.attrs = priority_cores_attrs,
+};
 
 static ssize_t __ref store_cc_enabled(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
@@ -4007,6 +4241,23 @@ static __init int msm_thermal_add_cc_nodes(void)
 		pr_err("cannot create sysfs group. err:%d\n", ret);
 		goto done_cc_nodes;
 	}
+
+	/* Cinnamon Priority Cores: Create sysfs entries */
+	priority_cores_kobj = kobject_create_and_add("priority_cores", module_kobj);
+	if (!priority_cores_kobj) {
+		pr_err("cannot create priority_cores kobj\n");
+		ret = -ENOMEM;
+		goto done_cc_nodes;
+	}
+
+	ret = sysfs_create_group(priority_cores_kobj, &priority_cores_attr_group);
+	if (ret) {
+		pr_err("cannot create priority_cores sysfs group. err:%d\n", ret);
+		kobject_del(priority_cores_kobj);
+		goto done_cc_nodes;
+	}
+
+	pr_info("Cinnamon Priority Cores sysfs initialized\n");
 
 	return 0;
 
