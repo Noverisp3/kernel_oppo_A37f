@@ -107,6 +107,7 @@ su
 .version
 
 # Junk
+dtbtool
 dtbtool/
 logcat.log*
 reportfromuser/
