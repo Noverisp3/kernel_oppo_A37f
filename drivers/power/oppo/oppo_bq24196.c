@@ -411,7 +411,9 @@ int bq24196_set_input_chg_current(struct opchg_charger *chip, int iusbin_mA, boo
 	// set current < 500mA
 	if(iusbin_mA <= CURRENT_500MA){
 		bq24196_iusbmax_set_noaicl(chip, iusbin_mA);
-		pr_err("%s no aicl 500ma,iusbin_mA:%d set input current is end \n",__func__,iusbin_mA);
+		#ifdef OPCHARGER_DEBUG_ENABLE
+		pr_debug("%s no aicl 500ma,iusbin_mA:%d set input current is end \n",__func__,iusbin_mA);
+		#endif
 		chip->is_charger_det = 0;
 		return 0;
 	}

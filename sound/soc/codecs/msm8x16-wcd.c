@@ -5324,8 +5324,10 @@ static int msm8x16_wcd_codec_enable_spk_ext_pa(struct snd_soc_dapm_widget *w,
 	//John.Xu@PhoneSw.AudioDriver, 2015/01/09, Add for yda145 boost
 		if (is_project(OPPO_15109) || is_project(OPPO_15399)) {
 			gpio_direction_output(msm8x16_wcd->mbhc.mbhc_cfg->gpio_yda145_boost_en, 0);
+			gpio_free(msm8x16_wcd->mbhc.mbhc_cfg->gpio_yda145_boost_en);
 		}
 		gpio_direction_output(msm8x16_wcd->mbhc.mbhc_cfg->gpio_spk_pa_en, 0);
+		gpio_free(msm8x16_wcd->mbhc.mbhc_cfg->gpio_spk_pa_en);
 		/*OPPO 2015-05-23 zhzhyon Add for pop*/
 		jiffies_yda145 = jiffies;
 		/*OPPO 2015-05-23 zhzhyon Add end*/

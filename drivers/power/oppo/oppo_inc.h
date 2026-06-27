@@ -113,12 +113,13 @@
 #include <soc/oppo/oppo_project.h>
 #include <soc/oppo/device_info.h>
 
-#undef pr_debug
-#define pr_debug(fmt, ...) printk(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
+// Charging log cleanup - remove debug to error redefinitions
+// #undef pr_debug
+// #define pr_debug(fmt, ...) printk(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
 //#define pr_err(fmt, ...) printk(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
 
-#undef dev_dbg
-#define dev_dbg(dev, format, arg...) dev_printk(KERN_ERR, dev, format, ##arg)
+// #undef dev_dbg
+// #define dev_dbg(dev, format, arg...) dev_printk(KERN_ERR, dev, format, ##arg)
 
 #ifndef OPCHARGER_DEBUG_ENABLE
 //#define OPCHARGER_DEBUG_ENABLE
