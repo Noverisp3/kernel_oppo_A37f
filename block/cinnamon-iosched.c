@@ -35,7 +35,7 @@
 #include <linux/genhd.h>
 
 /* Tunables */
-#define CINNAMON_WRITE_EXPIRE      (HZ / 8)      /* 125ms */
+#define CINNAMON_WRITE_EXPIRE      125           /* 125ms */
 #define CINNAMON_READ_BATCH        8
 #define CINNAMON_WRITE_BATCH        16
 #define CINNAMON_PRESSURE_THRES     24
@@ -227,7 +227,7 @@ static void cinnamon_update_ra(struct cinnamon_data *cd)
 static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 {
 	int old_pressure, curr_pressure;
-	int changed = 0;
+	int retries = 0;
 
 	do {
 		curr_pressure = atomic_read(&cinnamon_io_pressure);
@@ -240,15 +240,18 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 						       curr_pressure, 0);
 			if (old_pressure == curr_pressure) {
 				cd->last_pressure_change_jiffies = jiffies;
-				changed = 1;
-				/* Restore saved parameters when leaving non-idle */
-				if (curr_pressure != 0) {
-					cd->read_batch = cd->saved_read_batch;
-					cd->write_batch = cd->saved_write_batch;
-					cd->write_expire_ms = cd->saved_write_expire_ms;
-				}
+
+				/* Entering idle: save and halve parameters */
+				cd->saved_read_batch = cd->read_batch;
+				cd->saved_write_batch = cd->write_batch;
+				cd->saved_write_expire_ms = cd->write_expire_ms;
+				cd->read_batch = max(cd->read_batch / 2, 8);
+				cd->write_batch = max(cd->write_batch / 2, 8);
+				cd->write_expire_ms = min(cd->write_expire_ms + 100, 300);
+				cinnamon_clamp_for_emmc(cd);
+				cinnamon_update_ra(cd);
 			}
-			break;
+			return;
 		}
 
 		/* Hysteresis check for non-idle transitions */
@@ -262,32 +265,21 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 						       curr_pressure, new_pressure);
 			if (old_pressure == curr_pressure) {
 				cd->last_pressure_change_jiffies = jiffies;
-				changed = 1;
 
-				if (new_pressure == 0) {
-					/* Entering idle: save and halve parameters */
-					cd->saved_read_batch = cd->read_batch;
-					cd->saved_write_batch = cd->write_batch;
-					cd->saved_write_expire_ms = cd->write_expire_ms;
-					cd->read_batch = max(cd->read_batch / 2, 8);
-					cd->write_batch = max(cd->write_batch / 2, 8);
-					cd->write_expire_ms = min(cd->write_expire_ms + 100, 300);
-				} else if (curr_pressure == 0) {
-					/* Leaving idle: restore saved */
+				/* Leaving idle: restore saved */
+				if (curr_pressure == 0) {
 					cd->read_batch = cd->saved_read_batch;
 					cd->write_batch = cd->saved_write_batch;
 					cd->write_expire_ms = cd->saved_write_expire_ms;
 				}
 				cinnamon_clamp_for_emmc(cd);
+				cinnamon_update_ra(cd);
+				return;
 			}
 		} else {
-			/* Prevent decreasing pressure (except to idle) */
 			return;
 		}
-	} while (!changed);
-
-	if (changed)
-		cinnamon_update_ra(cd);
+	} while (++retries < 10);
 }
 
 /* Update read history with confidence-based prediction */
@@ -406,14 +398,18 @@ static int cinnamon_merge(struct request_queue *q, struct request **req,
 	int scanned = 0;
 
 	if (dir == READ) {
-		if (!list_empty(&cd->queues[PRIO_READ_FG]))
+		if (!list_empty(&cd->queues[PRIO_CRITICAL]))
+			queue_head = &cd->queues[PRIO_CRITICAL];
+		else if (!list_empty(&cd->queues[PRIO_READ_FG]))
 			queue_head = &cd->queues[PRIO_READ_FG];
 		else if (!list_empty(&cd->queues[PRIO_READ_BG]))
 			queue_head = &cd->queues[PRIO_READ_BG];
 		else
 			return ELEVATOR_NO_MERGE;
 	} else {
-		if (!list_empty(&cd->queues[PRIO_WRITE_FG]))
+		if (!list_empty(&cd->queues[PRIO_TRIM]))
+			queue_head = &cd->queues[PRIO_TRIM];
+		else if (!list_empty(&cd->queues[PRIO_WRITE_FG]))
 			queue_head = &cd->queues[PRIO_WRITE_FG];
 		else if (!list_empty(&cd->queues[PRIO_WRITE_BG]))
 			queue_head = &cd->queues[PRIO_WRITE_BG];
