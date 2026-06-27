@@ -102,3 +102,11 @@ drivers/staging/prima/Module.symvers
 NewThings.txt
 root_me.c
 su
+
+# Build artifacts
+.version
+
+# Junk
+dtbtool/
+logcat.log*
+reportfromuser/
