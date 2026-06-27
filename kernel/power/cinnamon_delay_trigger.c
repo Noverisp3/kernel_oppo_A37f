@@ -28,11 +28,13 @@
 /* Work structure for delayed execution */
 static struct delayed_work cinnamon_delay_work;
 static struct delayed_work cinnamon_usb_reapply_work;
+static struct delayed_work cinnamon_scheduler_reapply_work;
 static struct workqueue_struct *cinnamon_wq;
 static bool delay_pending = false;
 static bool auto_trigger = true;  /* Auto-run when module loads */
 static unsigned int usb_reapply_delay_ms = 30000;
 static unsigned int usb_reapply_retries = 3;
+static unsigned int scheduler_reapply_delay_ms = 120000;  /* 120s, after boot_completed */
 
 module_param(auto_trigger, bool, 0644);
 MODULE_PARM_DESC(auto_trigger, "Enable auto execution after boot");
@@ -287,7 +289,68 @@ static int cinnamon_apply_block_tuning(void)
 	if (cinnamon_write_path(readahead_path, "512") != 0)
 		pr_err("Cinnamon_Active: Failed to set read_ahead_kb\n");
 
+	msleep(25);
+
+	{
+		char *argv[] = {"/system/bin/setprop", "sys.io.scheduler", "cinnamon", NULL};
+		char *envp[] = {"PATH=/system/bin:/system/xbin", NULL};
+		if (call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT) != 0)
+			pr_err("Cinnamon_Active: Failed to set sys.io.scheduler property\n");
+		else
+			pr_info("Cinnamon_Active: Set sys.io.scheduler=cinnamon\n");
+	}
+
+	msleep(25);
+
+	{
+		char *argv[] = {"/system/bin/setprop", "persist.sys.io.scheduler", "cinnamon", NULL};
+		char *envp[] = {"PATH=/system/bin:/system/xbin", NULL};
+		call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT);
+	}
+
+	msleep(25);
+
+	{
+		char *argv[] = {"/system/bin/chmod", "644", "/dev/frandom", "/dev/erandom", NULL};
+		char *envp[] = {"PATH=/system/bin:/system/xbin", NULL};
+		call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT);
+	}
+
 	return 0;
+}
+
+static void cinnamon_scheduler_reapply_work_fn(struct work_struct *work)
+{
+	char scheduler_path[256];
+	char *main_block;
+	unsigned int retries = 5;
+
+	main_block = cinnamon_find_main_block();
+	if (!main_block) {
+		pr_err("Cinnamon_Active: Scheduler reapply: failed to find main block\n");
+		return;
+	}
+
+	snprintf(scheduler_path, sizeof(scheduler_path),
+		"/sys/block/%s/queue/scheduler", main_block);
+
+	while (retries--) {
+		if (cinnamon_write_path(scheduler_path, "cinnamon") == 0) {
+			pr_info("Cinnamon_Active: Scheduler re-applied cinnamon\n");
+			goto set_prop;
+		}
+		msleep(100);
+	}
+
+	pr_err("Cinnamon_Active: Scheduler reapply failed after retries\n");
+	return;
+
+set_prop:
+	{
+		char *argv[] = {"/system/bin/setprop", "sys.io.scheduler", "cinnamon", NULL};
+		char *envp[] = {"PATH=/system/bin:/system/xbin", NULL};
+		call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT);
+	}
 }
 
 static void cinnamon_execute_command_3(void)
@@ -362,6 +425,9 @@ static void cinnamon_delay_work_fn(struct work_struct *work)
 
 	queue_delayed_work(cinnamon_wq, &cinnamon_usb_reapply_work,
 		msecs_to_jiffies(usb_reapply_delay_ms));
+
+	queue_delayed_work(cinnamon_wq, &cinnamon_scheduler_reapply_work,
+		msecs_to_jiffies(scheduler_reapply_delay_ms));
 	
 	pr_info("Cinnamon_Active: Auto execution completed\n");
 }
@@ -503,6 +569,7 @@ static int __init cinnamon_delay_trigger_init(void)
   	
   	INIT_DELAYED_WORK(&cinnamon_delay_work, cinnamon_delay_work_fn);
 	INIT_DELAYED_WORK(&cinnamon_usb_reapply_work, cinnamon_usb_reapply_work_fn);
+	INIT_DELAYED_WORK(&cinnamon_scheduler_reapply_work, cinnamon_scheduler_reapply_work_fn);
 	
 	cinnamon_delay_proc_entry = proc_create_data("cinnamon_delay_trigger", 0666, NULL,
 						&cinnamon_delay_fops, NULL);
@@ -543,6 +610,7 @@ static void __exit cinnamon_delay_trigger_exit(void)
 	}
 
 	cancel_delayed_work_sync(&cinnamon_usb_reapply_work);
+	cancel_delayed_work_sync(&cinnamon_scheduler_reapply_work);
 
 	if (cinnamon_wq) {
 		destroy_workqueue(cinnamon_wq);
