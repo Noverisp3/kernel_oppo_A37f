@@ -2762,41 +2762,9 @@ static struct clk_lookup msm_clocks_lookup[] = {
 	CLK_LIST(gcc_snoc_qosgen_clk),
 };
 
-#define EFUSE_BASE	0x0005c004
-#define EFUSE_BASE1	0x0005c00c
-
 static void gcc_gfx3d_fmax(struct platform_device *pdev)
 {
-	void __iomem *base;
-
-	u32 pte_efuse, shift = 2, mask = 0x7;
-	int bin, version;
-
-	base = devm_ioremap(&pdev->dev, EFUSE_BASE, SZ_8);
-	if (!base) {
-		pr_err("unable to ioremap efuse base\n");
-		return;
-	}
-	pte_efuse = readl_relaxed(base);
-	devm_iounmap(&pdev->dev, base);
-	version = (pte_efuse >> 18) & 0x3;
-	if (!version)
-		return;
-
-	base = devm_ioremap(&pdev->dev, EFUSE_BASE1, SZ_8);
-	if (!base) {
-		pr_err("unable to ioremap efuse1 base\n");
-		return;
-	}
-	pte_efuse = readl_relaxed(base);
-	devm_iounmap(&pdev->dev, base);
-	bin = (pte_efuse >> shift) & mask;
-
-	if (bin != 2)
-		return;
-
-	pr_info("%s, Version: %d, bin: %d\n", __func__, version,
-					bin);
+	pr_info("%s: Forcing 465 MHz GPU (overclock)\n", __func__);
 
 	gfx3d_clk_src.c.fmax[VDD_DIG_HIGH] = 465000000;
 	gfx3d_clk_src.freq_tbl = ftbl_gcc_oxili_gfx3d_465_clk;
