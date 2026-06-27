@@ -663,5 +663,14 @@ config MSM_RDBG
           Implements a shared memory based transport mechanism that allows
           for a debugger running on a host PC to communicate with a remote
 	  stub running on peripheral subsystems such as the ADSP, MODEM etc.
+
+config FRANDOM
+	tristate "Fast Random Number Generator (frandom)"
+	default y
+	help
+	  Provides /dev/frandom (ISAAC PRNG based, very fast) and
+	  /dev/erandom (entropy-based, same source as /dev/urandom).
+	  FRandom can be used to speed up applications that require
+	  large amounts of random data.
 endmenu
 
