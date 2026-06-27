@@ -423,6 +423,13 @@ static void cinnamon_delay_work_fn(struct work_struct *work)
 	pr_info("Cinnamon_Active: Executing Step 3\n");
 	cinnamon_execute_command_3();
 
+	/* Step 4: Enable DT2W at boot */
+	{
+		msleep(50);
+		if (cinnamon_file_exists("/proc/touchpanel/double_tap_enable"))
+			cinnamon_write_path("/proc/touchpanel/double_tap_enable", "1");
+	}
+
 	queue_delayed_work(cinnamon_wq, &cinnamon_usb_reapply_work,
 		msecs_to_jiffies(usb_reapply_delay_ms));
 

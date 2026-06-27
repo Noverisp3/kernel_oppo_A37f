@@ -1,6 +1,13 @@
 # Cinnamon Kernel Changelog
 
-## Builds #319-#324 (Current)
+## Builds #325-#327 (Current)
+
+### DT2W Fix & Auto-Enable
+- FIX: DT2W toggle wasn't applying immediately because `is_suspended` guard blocked I2C writes when screen on (build #325)
+- FIX: DT2W reported KEY_F4 (143) which Android maps to WAKEUP but doesn't handle → changed to KEY_POWER (116) so Android wakes the screen (build #326)
+- Auto-enable DT2W at boot 30s after boot via Cinnamon_Active Step 4 (build #327)
+
+## Builds #319-#324
 
 ### CPU Overclock 1.3632 GHz (Corner 9)
 - Added corner 9 to OPPO A37 regulator (msm8916-regulator-15399.dtsi)

@@ -1238,9 +1238,9 @@ static void gesture_judge(struct synaptics_ts_data *ts)
     synaptics_get_coordinate_point(ts);
     if(gesture != UnkownGestrue ){
 			gesture_upload = gesture;
-			input_report_key(ts->input_dev, KEY_F4, 1);
+			input_report_key(ts->input_dev, KEY_POWER, 1);
 			input_sync(ts->input_dev);
-			input_report_key(ts->input_dev, KEY_F4, 0);
+			input_report_key(ts->input_dev, KEY_POWER, 0);
 			input_sync(ts->input_dev);
     }
 	   
@@ -2267,7 +2267,7 @@ static int	synaptics_input_init(struct synaptics_ts_data *ts)
 	set_bit(INPUT_PROP_DIRECT, ts->input_dev->propbit);
 
 #ifdef SUPPORT_GESTURE
-	set_bit(KEY_F4 , ts->input_dev->keybit);//doulbe-tap resume
+	set_bit(KEY_POWER , ts->input_dev->keybit);//doulbe-tap resume
 	set_bit(KEY_MENU , ts->input_dev->keybit);
 	set_bit(KEY_HOMEPAGE , ts->input_dev->keybit);
 	set_bit(KEY_BACK , ts->input_dev->keybit);
