@@ -1503,32 +1503,28 @@ static ssize_t tp_double_write_func(struct file *file, const char __user *buffer
 	TPD_ERR("%s: ret=%d is_suspended=%d\n",__func__,ret,ts->is_suspended);	
 	mutex_lock(&ts->mutex);
 	if( (ret == 0 )||(ret == 1) )
-			ts->double_enable = ret;	
-	if(ts->is_suspended == 1)	{
-		switch(ret) {
-			case 0:
-				ret = synaptics_enable_interrupt_for_gesture(ts, 0); 
+		ts->double_enable = ret;
+	switch(ret) {
+		case 0:
+			ret = synaptics_enable_interrupt_for_gesture(ts, 0);
+			if( ret<0 )
+				ret = synaptics_enable_interrupt_for_gesture(ts, 0);
+			ret = i2c_smbus_write_byte_data(ts->client, F01_RMI_CTRL00, 0x01);
+			if( ret < 0 )
+				TPD_ERR("write F01_RMI_CTRL00 failed\n");
+			break;
+		case 1:
+			ret = i2c_smbus_write_byte_data(ts->client, F01_RMI_CTRL00, 0x80);
+			if( ret < 0 )
+				TPD_ERR("write F01_RMI_CTRL00 failed\n");
+			else {
+				ret = synaptics_enable_interrupt_for_gesture(ts, 1);
 				if( ret<0 )
-					ret = synaptics_enable_interrupt_for_gesture(ts, 0); 
-				ret = i2c_smbus_write_byte_data(ts->client, F01_RMI_CTRL00, 0x01); 
-				if( ret < 0 ){
-					TPD_ERR("write F01_RMI_CTRL00 failed\n");
-					break;
-				}
-				break;
-			case 1:
-				ret = i2c_smbus_write_byte_data(ts->client, F01_RMI_CTRL00, 0x80); 
-				if( ret < 0 ){
-					TPD_ERR("write F01_RMI_CTRL00 failed\n");
-					break;
-				}
-				ret = synaptics_enable_interrupt_for_gesture(ts, 1); 
-				if( ret<0 )
-					ret = synaptics_enable_interrupt_for_gesture(ts, 1); 
-				break;
-			default:
-				TPD_ERR("Please enter 0 or 1 to open or close the double-tap function\n");
-		}
+					ret = synaptics_enable_interrupt_for_gesture(ts, 1);
+			}
+			break;
+		default:
+			TPD_ERR("Please enter 0 or 1 to open or close the double-tap function\n");
 	}
 	mutex_unlock(&ts->mutex);
 	TPD_ERR("%s: End\n",__func__);	
