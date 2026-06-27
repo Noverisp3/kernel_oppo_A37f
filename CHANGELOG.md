@@ -1,6 +1,26 @@
 # Cinnamon Kernel Changelog
 
-## Builds #325-#327 (Current)
+## Build #330 (Current)
+
+### GPU Overclock 620 MHz
+- Raised GPU from 465 MHz → 620 MHz (GPLL2/1.5, +33%)
+- Added F(620000000, gpll2, 1.5) to oxili_gfx3d_465 frequency table
+- Updated gcc_gfx3d_fmax: VDD_DIG_HIGH → 620 MHz
+- Updated msm8916-gpu.dtsi: pwrlevel@0 and speed-config@2 both at 620 MHz
+
+## Builds #328-#329
+
+### CPU Overclock 1.5 GHz (1.4976 GHz, Corner 10)
+- Raised corner 10 from 1.4 GHz → 1.4976 GHz (PLL L=78, 78 × 19.2 MHz)
+- Added F_APCS_PLL entry (1497600000, L=78) to apcs_pll_freq table
+- PLL fmax = 1.9 GHz at nominal voltage → safe margin
+- Updated speed0-bin-v0, speed0-bin-v1, speed2-bin-v1 tables
+- Updated cpufreq-table, cpu-to-dev-map with 1497600 kHz
+- Verified stable: stress test held 1.5 GHz, no CPR errors
+
+## Builds #325-#327
+
+### DT2W Fix & Auto-Enable
 
 ### DT2W Fix & Auto-Enable
 - FIX: DT2W toggle wasn't applying immediately because `is_suspended` guard blocked I2C writes when screen on (build #325)

@@ -348,6 +348,7 @@ static struct pll_freq_tbl apcs_pll_freq[] = {
 	F_APCS_PLL(1248000000, 65, 0x0, 0x1, 0x0, 0x0, 0x0),
 	F_APCS_PLL(1363200000, 71, 0x0, 0x1, 0x0, 0x0, 0x0),
 	F_APCS_PLL(1401600000, 73, 0x0, 0x1, 0x0, 0x0, 0x0),
+	F_APCS_PLL(1497600000, 78, 0x0, 0x1, 0x0, 0x0, 0x0),
 	PLL_F_END
 };
 
@@ -583,6 +584,7 @@ static struct clk_freq_tbl ftbl_gcc_oxili_gfx3d_465_clk[] = {
 	F( 310000000,	   gpll2,   3,	  0,	0),
 	F( 400000000,  gpll0_aux,   2,	  0,	0),
 	F( 465000000,      gpll2,   2,	  0,	0),
+	F( 620000000,      gpll2, 1.5,	  0,	0),
 	F_END
 };
 
@@ -2766,7 +2768,7 @@ static void gcc_gfx3d_fmax(struct platform_device *pdev)
 {
 	pr_info("%s: Forcing 465 MHz GPU (overclock)\n", __func__);
 
-	gfx3d_clk_src.c.fmax[VDD_DIG_HIGH] = 465000000;
+	gfx3d_clk_src.c.fmax[VDD_DIG_HIGH] = 620000000;
 	gfx3d_clk_src.freq_tbl = ftbl_gcc_oxili_gfx3d_465_clk;
 }
 
