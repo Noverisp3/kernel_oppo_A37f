@@ -84,13 +84,7 @@ struct spm_mm_slot {
 };
 
 /* Page flags for SPM (defined elsewhere) */
-#ifdef CONFIG_SPM
-/* defined in page-flags.h */
-#else
-static inline bool PageSpm(struct page *page) { return false; }
-static inline void SetPageSpm(struct page *page) { }
-static inline void ClearPageSpm(struct page *page) { }
-#endif
+/* PageSpm/SetPageSpm/ClearPageSpm are defined in page-flags.h via PAGEFLAG_FALSE */
 
 /* SPM API functions */
 #ifdef CONFIG_SPM
