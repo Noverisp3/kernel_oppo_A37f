@@ -49,13 +49,14 @@
 
 		/* Bus Scale Settings */
 		qcom,msm-bus,name = "grp3d";
-		qcom,msm-bus,num-cases = <4>;
+		qcom,msm-bus,num-cases = <5>;
 		qcom,msm-bus,num-paths = <1>;
 		qcom,msm-bus,vectors-KBps =
 			<26 512 0 0>,
 			<26 512 160000 1600000>,
 			<26 512 800000 3200000>,
-			<26 512 1190400 4761600>;
+			<26 512 1190400 4761600>,
+			<26 512 1340000 5360000>;
 
 		/* GDSC oxili regulators */
 		vdd-supply = <&gdsc_oxili_gx>;
@@ -85,7 +86,7 @@
 			qcom,gpu-pwrlevel@0 {
 				reg = <0>;
 				qcom,gpu-freq = <620000000>;
-				qcom,bus-freq = <3>;
+				qcom,bus-freq = <4>;
 			};
 
 			qcom,gpu-pwrlevel@1 {
@@ -106,19 +107,21 @@
 				qcom,bus-freq = <0>;
 			};
 		};
+
 		/* Speed levels */
 		qcom,gpu-speed-config@2 {
 			compatible = "gpu-speed-config@2";
 
 			/* Bus Scale Settings */
 			qcom,msm-bus,name = "grp3d";
-			qcom,msm-bus,num-cases = <4>;
+			qcom,msm-bus,num-cases = <5>;
 			qcom,msm-bus,num-paths = <1>;
 			qcom,msm-bus,vectors-KBps =
 			<26 512 0 0>,
 			<26 512 160000 1600000>,
 			<26 512 800000 3200000>,
-			<26 512 1190400 4761600>;
+			<26 512 1190400 4761600>,
+			<26 512 1340000 5360000>;
 
 			qcom,gpu-pwrlevels {
 				#address-cells = <1>;
@@ -129,7 +132,7 @@
 				qcom,gpu-pwrlevel@0 {
 					reg = <0>;
 					qcom,gpu-freq = <620000000>;
-					qcom,bus-freq = <3>;
+					qcom,bus-freq = <4>;
 				};
 
 				qcom,gpu-pwrlevel@1 {

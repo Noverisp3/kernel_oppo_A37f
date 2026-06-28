@@ -122,6 +122,9 @@ struct kgsl_pwrctrl {
 	unsigned int num_pwrlevels;
 	unsigned long interval_timeout;
 	bool strtstp_sleepwake;
+	bool gpu_idler;
+	unsigned int idle_workload;
+	unsigned int idle_workload_count;
 	struct regulator *gpu_reg;
 	struct regulator *gpu_cx;
 	uint32_t pcl;

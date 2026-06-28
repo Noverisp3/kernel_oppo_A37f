@@ -21,6 +21,10 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/clk.h>
+#include <linux/of.h>
+#include <linux/power_supply.h>
+#include <dt-bindings/clock/msm-clocks-8916.h>
 
 /* Delay period in milliseconds */
 #define CINNAMON_DELAY_MS	30000	/* 30 seconds */
@@ -29,6 +33,8 @@
 static struct delayed_work cinnamon_delay_work;
 static struct delayed_work cinnamon_usb_reapply_work;
 static struct delayed_work cinnamon_scheduler_reapply_work;
+static struct delayed_work cinnamon_bimc_retry_work;
+static struct delayed_work cinnamon_dynamic_fsync_work;
 static struct workqueue_struct *cinnamon_wq;
 static bool delay_pending = false;
 static bool auto_trigger = true;  /* Auto-run when module loads */
@@ -358,6 +364,81 @@ set_prop:
 	cinnamon_write_path("/proc/sys/vm/swappiness", "80");
 	msleep(10);
 	cinnamon_write_path("/proc/sys/vm/vfs_cache_pressure", "50");
+	msleep(10);
+	cinnamon_write_path("/proc/sys/net/ipv4/tcp_congestion_control", "westwood");
+}
+
+static void cinnamon_try_bimc_oc(void)
+{
+	struct clk *bimc_clk;
+	struct device_node *np;
+	struct of_phandle_args clkspec;
+	long rate;
+
+	np = of_find_compatible_node(NULL, NULL, "qcom,rpmcc-8916");
+	if (!np) {
+		pr_err("Cinnamon_Active: No rpmcc-8916 DT node found\n");
+		return;
+	}
+
+	clkspec.np = np;
+	clkspec.args_count = 1;
+	clkspec.args[0] = clk_bimc_clk;
+	bimc_clk = of_clk_get_from_provider(&clkspec);
+	of_node_put(np);
+	if (IS_ERR(bimc_clk)) {
+		pr_info("Cinnamon_Active: bimc_clk not ready yet: %ld, will retry\n", PTR_ERR(bimc_clk));
+		queue_delayed_work(cinnamon_wq, &cinnamon_bimc_retry_work,
+			msecs_to_jiffies(30000));
+		return;
+	}
+
+	rate = clk_get_rate(bimc_clk);
+	pr_info("Cinnamon_Active: BIMC clock rate before: %ld Hz\n", rate);
+
+	rate = clk_round_rate(bimc_clk, 600000000);
+	pr_info("Cinnamon_Active: BIMC round_rate(600MHz) = %ld Hz\n", rate);
+
+	clk_set_rate(bimc_clk, 600000000);
+	msleep(10);
+
+	rate = clk_get_rate(bimc_clk);
+	pr_info("Cinnamon_Active: BIMC clock rate after: %ld Hz\n", rate);
+
+	clk_put(bimc_clk);
+}
+
+static void cinnamon_bimc_retry_work_fn(struct work_struct *work)
+{
+	cinnamon_try_bimc_oc();
+}
+
+static void cinnamon_dynamic_fsync_work_fn(struct work_struct *work)
+{
+	struct power_supply *battery;
+	union power_supply_propval cap, status;
+	int enable = 0;
+
+	battery = power_supply_get_by_name("battery");
+	if (battery) {
+		if (battery->get_property(battery, POWER_SUPPLY_PROP_CAPACITY, &cap) == 0 &&
+		    battery->get_property(battery, POWER_SUPPLY_PROP_STATUS, &status) == 0) {
+			if (cap.intval > 30 && status.intval != POWER_SUPPLY_STATUS_CHARGING &&
+			    status.intval != POWER_SUPPLY_STATUS_FULL)
+				enable = 1;
+		}
+	}
+
+	if (cinnamon_write_path("/proc/dynamic_fsync", enable ? "1" : "0") == 0) {
+		if (enable)
+			pr_info("Cinnamon_Active: dynamic_fsync enabled (cap=%d%%)\n", cap.intval);
+		else if (battery)
+			pr_info("Cinnamon_Active: dynamic_fsync disabled (cap=%d%%, status=%d)\n",
+				cap.intval, status.intval);
+	}
+
+	queue_delayed_work(cinnamon_wq, &cinnamon_dynamic_fsync_work,
+		msecs_to_jiffies(60000));
 }
 
 static void cinnamon_execute_command_3(void)
@@ -467,7 +548,13 @@ static void cinnamon_execute_command_3(void)
 				"0,100,200,300,528,900");
 		}
 	}
-	pr_info("Cinnamon_Active: VM, interactive governor, USB gadget, and LMK optimization completed\n");
+
+	/* Step 8: TCP Westwood+ for lower wireless latency */
+	{
+		msleep(25);
+		cinnamon_write_path("/proc/sys/net/ipv4/tcp_congestion_control", "westwood");
+	}
+	pr_info("Cinnamon_Active: VM, interactive governor, USB gadget, LMK, and TCP Westwood optimization completed\n");
 }
 
 /* Main work function - executes after delay */
@@ -494,11 +581,51 @@ static void cinnamon_delay_work_fn(struct work_struct *work)
 			cinnamon_write_path("/proc/touchpanel/double_tap_enable", "1");
 	}
 
+	/* Step 5: Try to force BIMC (DDR) clock to 600 MHz */
+	cinnamon_try_bimc_oc();
+
+	/* Step 6: Enable Adreno Idler */
+	{
+		const char *gpu_paths[] = {
+			"/sys/devices/soc.0/1c00000.qcom,kgsl-3d0/kgsl/kgsl-3d0/gpu_idler",
+			"/sys/devices/soc.0/fdb00000.qcom,kgsl-3d0/kgsl/kgsl-3d0/gpu_idler",
+			NULL
+		};
+		int i;
+		for (i = 0; gpu_paths[i]; i++) {
+			if (cinnamon_file_exists(gpu_paths[i])) {
+				cinnamon_write_path(gpu_paths[i], "1");
+				break;
+			}
+		}
+	}
+
+	/* Step 7: Block known battery-draining wakelocks */
+	{
+		const char *block_list[] = {
+			"+wlan_wake", "+wlan_rx_wake", "+wlan_ctrl_wake",
+			"+wlan_ipa", "+wlan_pno_wake", "+netmgr_wake",
+			"+IPA_WS", "+qcom_rx_wakelock", "+ss_route_work",
+			"+radio-interface", "+qcril", "+ims_socket_wake",
+			"+CNE_WAKELOCK", "+cne_wqe_wake", "+power_policy_wake",
+			NULL
+		};
+		int i;
+		for (i = 0; block_list[i]; i++) {
+			if (cinnamon_file_exists("/proc/wakelock_blocker"))
+				cinnamon_write_path("/proc/wakelock_blocker",
+					block_list[i]);
+		}
+	}
+
 	queue_delayed_work(cinnamon_wq, &cinnamon_usb_reapply_work,
 		msecs_to_jiffies(usb_reapply_delay_ms));
 
 	queue_delayed_work(cinnamon_wq, &cinnamon_scheduler_reapply_work,
 		msecs_to_jiffies(scheduler_reapply_delay_ms));
+
+	queue_delayed_work(cinnamon_wq, &cinnamon_dynamic_fsync_work,
+		msecs_to_jiffies(120000));
 	
 	pr_info("Cinnamon_Active: Auto execution completed\n");
 }
@@ -641,6 +768,8 @@ static int __init cinnamon_delay_trigger_init(void)
   	INIT_DELAYED_WORK(&cinnamon_delay_work, cinnamon_delay_work_fn);
 	INIT_DELAYED_WORK(&cinnamon_usb_reapply_work, cinnamon_usb_reapply_work_fn);
 	INIT_DELAYED_WORK(&cinnamon_scheduler_reapply_work, cinnamon_scheduler_reapply_work_fn);
+	INIT_DELAYED_WORK(&cinnamon_bimc_retry_work, cinnamon_bimc_retry_work_fn);
+	INIT_DELAYED_WORK(&cinnamon_dynamic_fsync_work, cinnamon_dynamic_fsync_work_fn);
 	
 	cinnamon_delay_proc_entry = proc_create_data("cinnamon_delay_trigger", 0666, NULL,
 						&cinnamon_delay_fops, NULL);
@@ -682,6 +811,8 @@ static void __exit cinnamon_delay_trigger_exit(void)
 
 	cancel_delayed_work_sync(&cinnamon_usb_reapply_work);
 	cancel_delayed_work_sync(&cinnamon_scheduler_reapply_work);
+	cancel_delayed_work_sync(&cinnamon_bimc_retry_work);
+	cancel_delayed_work_sync(&cinnamon_dynamic_fsync_work);
 
 	if (cinnamon_wq) {
 		destroy_workqueue(cinnamon_wq);

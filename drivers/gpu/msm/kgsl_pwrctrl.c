@@ -671,6 +671,74 @@ static ssize_t kgsl_pwrctrl_idle_timer_show(struct device *dev,
 		jiffies_to_msecs(device->pwrctrl.interval_timeout));
 }
 
+static ssize_t kgsl_pwrctrl_gpu_idler_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	unsigned int val = 0;
+	struct kgsl_device *device = kgsl_device_from_dev(dev);
+	int ret;
+
+	if (device == NULL)
+		return 0;
+
+	ret = kgsl_sysfs_store(buf, &val);
+	if (ret)
+		return ret;
+
+	device->pwrctrl.gpu_idler = val ? true : false;
+	if (device->pwrctrl.gpu_idler)
+		device->pwrctrl.idle_workload_count = 0;
+
+	return count;
+}
+
+static ssize_t kgsl_pwrctrl_gpu_idler_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct kgsl_device *device = kgsl_device_from_dev(dev);
+	if (device == NULL)
+		return 0;
+	return snprintf(buf, PAGE_SIZE, "%d\n",
+		device->pwrctrl.gpu_idler ? 1 : 0);
+}
+
+static ssize_t kgsl_pwrctrl_idleworkload_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	unsigned int val = 0;
+	struct kgsl_device *device = kgsl_device_from_dev(dev);
+	int ret;
+
+	if (device == NULL)
+		return 0;
+
+	ret = kgsl_sysfs_store(buf, &val);
+	if (ret)
+		return ret;
+
+	if (val < 1 || val > 100)
+		return -EINVAL;
+
+	device->pwrctrl.idle_workload = val;
+	device->pwrctrl.idle_workload_count = 0;
+
+	return count;
+}
+
+static ssize_t kgsl_pwrctrl_idleworkload_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct kgsl_device *device = kgsl_device_from_dev(dev);
+	if (device == NULL)
+		return 0;
+	return snprintf(buf, PAGE_SIZE, "%u\n",
+		device->pwrctrl.idle_workload);
+}
+
 static ssize_t kgsl_pwrctrl_pmqos_active_latency_store(struct device *dev,
 					struct device_attribute *attr,
 					const char *buf, size_t count)
@@ -931,7 +999,7 @@ static DEVICE_ATTR(gpuclk, 0644, kgsl_pwrctrl_gpuclk_show,
 	kgsl_pwrctrl_gpuclk_store);
 static DEVICE_ATTR(max_gpuclk, 0644, kgsl_pwrctrl_max_gpuclk_show,
 	kgsl_pwrctrl_max_gpuclk_store);
-static DEVICE_ATTR(idle_timer, 0644, kgsl_pwrctrl_idle_timer_show,
+static DEVICE_ATTR(idle_timer, 0666, kgsl_pwrctrl_idle_timer_show,
 	kgsl_pwrctrl_idle_timer_store);
 static DEVICE_ATTR(gpubusy, 0444, kgsl_pwrctrl_gpubusy_show,
 	NULL);
@@ -971,6 +1039,12 @@ static DEVICE_ATTR(bus_split, 0644,
 static DEVICE_ATTR(default_pwrlevel, 0644,
 	kgsl_pwrctrl_default_pwrlevel_show,
 	kgsl_pwrctrl_default_pwrlevel_store);
+static DEVICE_ATTR(gpu_idler, 0666,
+	kgsl_pwrctrl_gpu_idler_show,
+	kgsl_pwrctrl_gpu_idler_store);
+static DEVICE_ATTR(gpu_idler_idleworkload, 0666,
+	kgsl_pwrctrl_idleworkload_show,
+	kgsl_pwrctrl_idleworkload_store);
 
 static const struct device_attribute *pwrctrl_attr_list[] = {
 	&dev_attr_gpuclk,
@@ -989,6 +1063,8 @@ static const struct device_attribute *pwrctrl_attr_list[] = {
 	&dev_attr_force_rail_on,
 	&dev_attr_bus_split,
 	&dev_attr_default_pwrlevel,
+	&dev_attr_gpu_idler,
+	&dev_attr_gpu_idler_idleworkload,
 	NULL
 };
 
@@ -1514,9 +1590,27 @@ void kgsl_idle_check(struct work_struct *work)
 	if (device->state == KGSL_STATE_ACTIVE
 		   || device->state ==  KGSL_STATE_NAP) {
 
-		if (!atomic_read(&device->active_cnt))
+		if (!atomic_read(&device->active_cnt)) {
+			if (device->pwrctrl.gpu_idler &&
+			    device->state == KGSL_STATE_NAP &&
+			    device->requested_state != KGSL_STATE_SUSPEND) {
+				unsigned int threshold = device->pwrctrl.idle_workload
+					? device->pwrctrl.idle_workload : 10;
+				device->pwrctrl.idle_workload_count++;
+				if (device->pwrctrl.idle_workload_count <
+				    threshold) {
+					mod_timer(&device->idle_timer,
+						jiffies +
+						device->pwrctrl.interval_timeout);
+					kgsl_pwrscale_update(device);
+					mutex_unlock(&device->mutex);
+					return;
+				}
+			}
+			device->pwrctrl.idle_workload_count = 0;
 			kgsl_pwrctrl_change_state(device,
 					device->requested_state);
+		}
 
 		kgsl_pwrctrl_request_state(device, KGSL_STATE_NONE);
 		if (device->state == KGSL_STATE_ACTIVE)
@@ -2006,6 +2100,7 @@ int kgsl_active_count_get(struct kgsl_device *device)
 		wait_for_completion(&device->hwaccess_gate);
 		mutex_lock(&device->mutex);
 		device->pwrctrl.superfast = true;
+		device->pwrctrl.idle_workload_count = 0;
 		ret = kgsl_pwrctrl_change_state(device, KGSL_STATE_ACTIVE);
 	}
 	if (ret == 0)

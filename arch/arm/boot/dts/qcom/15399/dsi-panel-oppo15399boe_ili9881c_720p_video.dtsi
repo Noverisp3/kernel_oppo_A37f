@@ -19,7 +19,7 @@
 				qcom,mdss-dsi-panel-controller = <&mdss_dsi0>;
 				qcom,mdss-dsi-panel-type = "dsi_video_mode";
 				qcom,mdss-dsi-panel-destination = "display_1";
-				qcom,mdss-dsi-panel-framerate = <60>;
+				qcom,mdss-dsi-panel-framerate = <65>;
 				qcom,mdss-dsi-virtual-channel-id = <0x0>;
 				qcom,mdss-dsi-stream = <0x0>;
 				qcom,mdss-dsi-panel-width = <720>;
@@ -28,8 +28,8 @@
 				qcom,mdss-dsi-h-back-porch = <160>;
 				qcom,mdss-dsi-h-pulse-width = <2>;
 				qcom,mdss-dsi-h-sync-skew = <0>;
-				qcom,mdss-dsi-v-back-porch = <24>;
-				qcom,mdss-dsi-v-front-porch = <24>;
+				qcom,mdss-dsi-v-back-porch = <12>;
+				qcom,mdss-dsi-v-front-porch = <12>;
 				qcom,mdss-dsi-v-pulse-width = <8>;
 				qcom,mdss-dsi-h-left-border = <0>;
 				qcom,mdss-dsi-h-right-border = <0>;
@@ -78,7 +78,6 @@
 				qcom,mdss-dsi-reset-sequence = <1 10>, <0 1>, <1 15>;
 				qcom,mdss-pan-physical-width-dimension = <62>;
 				qcom,mdss-pan-physical-height-dimension = <110>;
-				qcom,cont-splash-enabled;
 				qcom,esd-check-enabled;
 			};
 };

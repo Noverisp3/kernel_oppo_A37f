@@ -1,6 +1,82 @@
 # Cinnamon Kernel Changelog
 
-## Build #333 (Current)
+## Build #351 (Current)
+
+### Adreno Idler + Wakelock Blocker (2026-06-28)
+
+- **Adreno Idler**: GPU stays in NAP (clocks off, rail on) for N idle cycles before deep sleep. Reduces SLEEP→ACTIVE thrashing during light GPU use. Sysfs: `gpu_idler` (on/off), `gpu_idler_idleworkload` (cycles, default 10)
+- **Wakelock Blocker**: `/proc/wakelock_blocker` — block known battery-draining wakelocks (`+name` to add, `-name` to remove). 15 wakelocks blocked by default: wlan_wake, wlan_rx_wake, wlan_ctrl_wake, wlan_ipa, wlan_pno_wake, netmgr_wake, IPA_WS, qcom_rx_wakelock, ss_route_work, radio-interface, qcril, ims_socket_wake, CNE_WAKELOCK, cne_wqe_wake, power_policy_wake
+- GPU sysfs permissions raised to 0666 for userspace write access
+- Auto-enabled at boot via Cinnamon_Active Step 6–7
+
+## Build #350
+
+### Dynamic Fsync (2026-06-28)
+
+- **vfs_fsync_range hook**: `/proc/dynamic_fsync` (1=skip fsync, 0=normal). Pin > 30% và không sạc → skip fsync (I/O nhanh hơn). Pin ≤ 30% hoặc đang sạc → fsync bình thường (an toàn dữ liệu)
+- Cinnamon_Active monitor battery mỗi 60s, tự động bật/tắt theo dung lượng pin
+- Safe design: re-enables fsync on low battery, charging, or suspend
+
+## Build #349
+
+### TCP Westwood+ (2026-06-28)
+
+- **TCP Westwood+** enabled as default congestion control (thay CUBIC). Bandwidth estimation, phù hợp WiFi/mobile hơn (không giảm tốc do nhiễu sóng)
+- Available: westwood, reno, bic, cubic, htcp
+- Localversion: `-lineageos` → `-cinnamon`
+- `lineageos_a37f_defconfig` removed, chỉ còn `cinnamon_A37f_defconfig`
+
+## Build #346
+
+### Thermal Relax
+
+- CPU frequency throttle: 60°C → **70°C**
+- Core limit throttle: 80°C → **85°C**
+- Hotplug/freq-mitigation: 94°C → **100°C**
+
+## Builds #344–#345
+
+### Panel Overclock 65fps + Touch Boost
+
+- **Panel 60→65fps**: pclk=89,202,880 Hz, DSI VCO=356,811,520 Hz, bit clock=714 MHz (+6.6%). Modified BOE ILI9881C, TM NT35521S, Truly NT35521S panels. Reduced VBP/VFP
+- **Fix**: removed `cont-splash-enabled` từ panel DTS (blocking DTS timing)
+- **Touch I2C 400kHz**: QUP5 bus 100kHz→400kHz
+- **Synaptics**: `nosleep=1`, `report_rate=1` in wake function
+- LM3630 PWM backlight: I2C dimming mode, `pwm-active=0`, PWM frequency hardware-fixed
+
+## Builds #341–#343
+
+### BIMC Clock OC Attempt (Abandoned)
+
+- `of_clk_get_from_provider()` với `qcom,rpmcc-8916` DT node thành công (build #341)
+- `clk_round_rate(600MHz)=600MHz`, `clk_set_rate` trả về success
+- **Nhưng**: hardware vẫn 533 MHz — RPM firmware black box rejects higher rate votes
+- BIMC timing registers S_SCMO at TrustZone locked — writes cause crash (build #342–#343, reverted)
+- **Kết luận**: DDR không thể OC trên MSM8916
+
+## Builds #338–#339
+
+### DDR bw-tbl Override
+
+- Added 5th entry `<4578>` to DDR bw-tbl, updated cpu-to-dev-map, added 5th GPU bus vector
+- No effect on BIMC clock — RPM controls PLL, ignores higher rate votes
+
+## Build #337
+
+### Backlight Gamma Curve
+
+- Replaced `MDSS_BRIGHT_TO_BL` macro with gamma-like curve (brighter at low brightness)
+- `bl_min_lvl`: 30 → **1** (dimmer minimum backlight)
+
+## Builds #334–#335
+
+### Defconfig Cleanup
+
+- Removed ~115 unnecessary config options: unused filesystems (btrfs, nilfs, jfs...), unused crypto algorithms (serpent, twofish, blowfish, camellia...), unused network protocols (DCCP, SCTP, DECnet, IPX, AppleTalk...), unused drivers (ISDN, telephony, WAN, CAN...)
+- Cleaned DTS directory: chỉ giữ `cinnamon_A37f_defconfig` và 32 msm8916 DTS files
+- Removed `CONFIG_MSM_FED` (tăng tốc panic)
+
+## Build #333
 
 ### 120s Reapply: Fix Android Override of extra_free_kbytes
 
@@ -116,5 +192,7 @@
 
 ## Pending Ideas
 - USB Fast Charge
-- Dynamic Fsync
 - OverlayFS for Docker in chroot
+- Sound Control (faux, tăng max volume)
+- ZRAM 1GB + lz4/zstd
+- Input boost duration 40ms→80ms

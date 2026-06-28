@@ -3961,7 +3961,8 @@ static void synaptics_rmi4_sensor_wake(struct synaptics_rmi4_data *rmi4_data)
 	}
 
 	device_ctrl.sleep_mode = NORMAL_OPERATION;
-	device_ctrl.nosleep = NO_SLEEP_OFF;
+	device_ctrl.nosleep = NO_SLEEP_ON;
+	device_ctrl.report_rate = 1;
 
 	retval = synaptics_rmi4_i2c_write(rmi4_data,
 			rmi4_data->f01_ctrl_base_addr,

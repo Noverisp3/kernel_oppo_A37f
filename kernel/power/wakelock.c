@@ -17,8 +17,12 @@
 #include <linux/list.h>
 #include <linux/rbtree.h>
 #include <linux/slab.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
 
 static DEFINE_MUTEX(wakelocks_lock);
+static DEFINE_MUTEX(wakelock_blocker_lock);
 
 struct wakelock {
 	char			*name;
@@ -29,7 +33,120 @@ struct wakelock {
 #endif
 };
 
+struct wakelock_blocker_entry {
+	char			*name;
+	struct list_head	list;
+};
+
+static LIST_HEAD(wakelock_blocked_list);
+
 static struct rb_root wakelocks_tree = RB_ROOT;
+
+static bool wakelock_is_blocked(const char *name, size_t len)
+{
+	struct wakelock_blocker_entry *entry;
+	bool blocked = false;
+
+	mutex_lock(&wakelock_blocker_lock);
+	list_for_each_entry(entry, &wakelock_blocked_list, list) {
+		if (strncmp(name, entry->name, len) == 0 && !entry->name[len]) {
+			blocked = true;
+			break;
+		}
+	}
+	mutex_unlock(&wakelock_blocker_lock);
+	return blocked;
+}
+
+static int wakelock_blocker_proc_show(struct seq_file *m, void *v)
+{
+	struct wakelock_blocker_entry *entry;
+
+	mutex_lock(&wakelock_blocker_lock);
+	list_for_each_entry(entry, &wakelock_blocked_list, list)
+		seq_printf(m, "%s\n", entry->name);
+	mutex_unlock(&wakelock_blocker_lock);
+	return 0;
+}
+
+static int wakelock_blocker_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, wakelock_blocker_proc_show, NULL);
+}
+
+static ssize_t wakelock_blocker_proc_write(struct file *file,
+		const char __user *buf, size_t count, loff_t *ppos)
+{
+	char kbuf[128];
+	char *name, *cmd;
+	struct wakelock_blocker_entry *entry, *tmp;
+	int ret = count;
+
+	if (count > sizeof(kbuf) - 1)
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+	kbuf[count] = '\0';
+
+	if (kbuf[count - 1] == '\n')
+		kbuf[count - 1] = '\0';
+
+	cmd = strstrip(kbuf);
+
+	mutex_lock(&wakelock_blocker_lock);
+
+	if (cmd[0] == '+') {
+		name = cmd + 1;
+		if (!*name)
+			goto unlock;
+		list_for_each_entry(entry, &wakelock_blocked_list, list) {
+			if (!strcmp(name, entry->name))
+				goto unlock;
+		}
+		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+		if (!entry) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
+		entry->name = kstrdup(name, GFP_KERNEL);
+		if (!entry->name) {
+			kfree(entry);
+			ret = -ENOMEM;
+			goto unlock;
+		}
+		list_add_tail(&entry->list, &wakelock_blocked_list);
+	} else if (cmd[0] == '-') {
+		name = cmd + 1;
+		if (!*name)
+			goto unlock;
+		list_for_each_entry_safe(entry, tmp, &wakelock_blocked_list, list) {
+			if (!strcmp(name, entry->name)) {
+				list_del(&entry->list);
+				kfree(entry->name);
+				kfree(entry);
+				break;
+			}
+		}
+	} else if (!strcmp(cmd, "clear")) {
+		list_for_each_entry_safe(entry, tmp, &wakelock_blocked_list, list) {
+			list_del(&entry->list);
+			kfree(entry->name);
+			kfree(entry);
+		}
+	}
+
+unlock:
+	mutex_unlock(&wakelock_blocker_lock);
+	return ret;
+}
+
+static const struct file_operations wakelock_blocker_fops = {
+	.open		= wakelock_blocker_proc_open,
+	.read		= seq_read,
+	.write		= wakelock_blocker_proc_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
 
 ssize_t pm_show_wakelocks(char *buf, bool show_active)
 {
@@ -181,6 +298,13 @@ static struct wakelock *wakelock_lookup_add(const char *name, size_t len,
 	return wl;
 }
 
+static int __wakelock_blocker_proc_init(void)
+{
+	proc_create("wakelock_blocker", 0666, NULL, &wakelock_blocker_fops);
+	return 0;
+}
+late_initcall(__wakelock_blocker_proc_init);
+
 int pm_wake_lock(const char *buf)
 {
 	const char *str = buf;
@@ -198,6 +322,9 @@ int pm_wake_lock(const char *buf)
 	len = str - buf;
 	if (!len)
 		return -EINVAL;
+
+	if (wakelock_is_blocked(buf, len))
+		return 0;
 
 	if (*str && *str != '\n') {
 		/* Find out if there's a valid timeout string appended. */
