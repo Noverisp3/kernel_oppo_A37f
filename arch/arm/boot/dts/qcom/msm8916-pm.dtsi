@@ -145,7 +145,8 @@
 				qcom,min-child-idx = <1>;
 			};
 
-			qcom,pm-cluster-level@2{
+			/* L2 PC disabled: 11ms wake latency causes UI jank */
+			/*qcom,pm-cluster-level@2{
 				reg = <2>;
 				label = "l2-pc";
 				qcom,spm-l2-mode = "pc";
@@ -155,7 +156,7 @@
 				qcom,time-overhead = <1580>;
 				qcom,min-child-idx = <2>;
 				qcom,notify-rpm;
-			};
+			};*/
 
 			qcom,pm-cpu {
 				#address-cells = <1>;

@@ -390,6 +390,13 @@ static void cinnamon_execute_command_3(void)
 		if (cinnamon_write_path("/proc/sys/vm/dirty_ratio", "15") != 0) {
 			pr_err("Cinnamon_Active: Failed to set dirty_ratio\n");
 		}
+		
+		msleep(25);
+		
+		/* extra_free_kbytes = 16384: give kswapd more headroom, reduce direct reclaim stalls */
+		if (cinnamon_write_path("/proc/sys/vm/extra_free_kbytes", "16384") != 0) {
+			pr_err("Cinnamon_Active: Failed to set extra_free_kbytes\n");
+		}
 	}
 	
 	/* Step 4: Scheduler optimization */
@@ -398,12 +405,62 @@ static void cinnamon_execute_command_3(void)
 		cinnamon_apply_block_tuning();
 	}
 
-	/* Step 5: USB Gadget setup for ADB+HID */
+	/* Step 5: Interactive governor tuning */
+	{
+		int i;
+		const char *cpu_policies[] = {
+			"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+			"/sys/devices/system/cpu/cpu1/cpufreq/scaling_governor",
+			"/sys/devices/system/cpu/cpu2/cpufreq/scaling_governor",
+			"/sys/devices/system/cpu/cpu3/cpufreq/scaling_governor",
+		};
+
+		msleep(50);
+
+		/* Switch from performance to interactive governor */
+		for (i = 0; i < 4; i++) {
+			if (cinnamon_file_exists(cpu_policies[i]))
+				cinnamon_write_path(cpu_policies[i], "interactive");
+		}
+
+		msleep(50);
+
+		/* Tune interactive governor for low-latency UI response */
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load", "75");
+		msleep(10);
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "1497600");
+		msleep(10);
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "40000");
+		msleep(10);
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/timer_rate", "10000");
+		msleep(10);
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/target_loads", "80");
+		msleep(10);
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay", "20000");
+		msleep(10);
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/io_is_busy", "1");
+		msleep(10);
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration", "40000");
+	}
+
+	/* Step 6: USB Gadget setup for ADB+HID */
 	{
 		msleep(100);
 		cinnamon_apply_usb_gadget();
 	}
-	pr_info("Cinnamon_Active: VM, scheduler, and USB gadget optimization completed\n");
+
+	/* Step 7: LMK tuning for 2GB RAM */
+	{
+		msleep(50);
+		if (cinnamon_file_exists("/sys/module/lowmemorykiller/parameters/minfree")) {
+			cinnamon_write_path("/sys/module/lowmemorykiller/parameters/minfree",
+				"7168,8192,11776,15360,18944,22528");
+			msleep(10);
+			cinnamon_write_path("/sys/module/lowmemorykiller/parameters/adj",
+				"0,100,200,300,528,900");
+		}
+	}
+	pr_info("Cinnamon_Active: VM, interactive governor, USB gadget, and LMK optimization completed\n");
 }
 
 /* Main work function - executes after delay */

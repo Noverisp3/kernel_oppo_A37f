@@ -1,6 +1,34 @@
 # Cinnamon Kernel Changelog
 
-## Build #330 (Current)
+## Build #332 (Current)
+
+### Kernel Defaults: Android-Proof Tunables
+
+- **extra_free_kbytes**: default 0 → **16384** in `mm/page_alloc.c` (không cần delay_trigger, Android ko ghi đè được)
+- **LMK 2GB tuning**: default minfree đổi từ (1536,2048,4096,16384) → **(7168,8192,11776,15360,18944,22528)** pages trong `lowmemorykiller.c` (lmkd vẫn ghi đè được nhưng init tốt hơn)
+- **Interactive governor defaults** trong `cpufreq_interactive.c`:
+  - go_hispeed_load: 85 → **75**
+  - timer_rate: 20ms → **10ms**
+  - min_sample_time: 80ms → **40ms**
+  - target_load: 90 → **80**
+  - io_is_busy: false → **true**
+  - above_hispeed_delay: 10ms → **20ms**
+
+### Ghi chú
+- Build #331 verified: L2 PC, GPU idle=500ms, RCU_BOOST_DELAY, io_is_busy giữ được. extra_free_kbytes, LMK minfree, governor tunables bị Android power HAL/lmkd ghi đè sau boot.
+- Build #332 chuyển các giá trị quan trọng thành kernel defaults để không bị ghi đè khi Android userspace load.
+
+## Build #331
+
+### Performance Tuning: Hệ thống
+- **Tắt L2 Power Collapse**: wake latency 11ms → 240µs (msm8916-pm.dtsi, giảm jank sau idle)
+- **GPU idle timeout**: 80ms → 500ms (msm8916-gpu.dtsi, giữ GPU sẵn sàng lâu hơn)
+- **RCU_BOOST_DELAY**: 500ms → 100ms (defconfig, boost RCU callbacks nhanh hơn)
+- **extra_free_kbytes**: 0 → 16384 (delay_trigger, kswapd headroom chống direct reclaim stall)
+- **Interactive governor tuning**: go_hispeed_load=75, min_sample_time=40ms, timer_rate=10ms, target_loads=80, io_is_busy=1, hispeed_freq=1497600
+- **LMK 2GB tuning**: minfree 7168,8192,11776,15360,18944,22528 pages (giết nền vừa phải)
+
+## Build #330
 
 ### GPU Overclock 620 MHz
 - Raised GPU from 465 MHz → 620 MHz (GPLL2/1.5, +33%)
