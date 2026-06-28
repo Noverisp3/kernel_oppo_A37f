@@ -2,7 +2,7 @@
 
 ## Build #333 (Current)
 
-### 120s Reapply: Fix Android Override extra_free_kbytes
+### 120s Reapply: Fix Android Override of extra_free_kbytes
 
 - **Scheduler reapply work (120s)** now also reapplies extra_free_kbytes=16384, swappiness=80, vfs_cache_pressure=50
 - Fix: init writes extra_free_kbytes at ~50s via `sys.sysctl.extra_free_kbytes` property, overriding delay_trigger's write at ~39s. 120s reapply fires AFTER init so final value is ours.
@@ -12,24 +12,24 @@
 ### Kernel Defaults: Android-Proof Tunables
 
 - **extra_free_kbytes**: default 0 → **16384** in `mm/page_alloc.c`
-- **LMK 2GB tuning**: default minfree (1536,2048,4096,16384) → **(7168,8192,11776,15360,18944,22528)** pages trong `lowmemorykiller.c`
-- **Interactive governor defaults** trong `cpufreq_interactive.c`:
+- **LMK 2GB tuning**: default minfree (1536,2048,4096,16384) → **(7168,8192,11776,15360,18944,22528)** pages in `lowmemorykiller.c`
+- **Interactive governor defaults** in `cpufreq_interactive.c`:
   - go_hispeed_load: 85 → **75**, timer_rate: 20ms → **10ms**
   - min_sample_time: 80ms → **40ms**, target_load: 90 → **80**
   - io_is_busy: false → **true**, above_hispeed_delay: 10ms → **20ms**
 
-### Ghi chú
-- Build #331 verified: L2 PC, GPU idle=500ms, RCU_BOOST_DELAY, io_is_busy giữ được. extra_free_kbytes, LMK minfree, governor tunables bị Android power HAL/lmkd ghi đè sau boot.
+### Notes
+- Build #331 verified: L2 PC, GPU idle=500ms, RCU_BOOST_DELAY, io_is_busy survived Android override. extra_free_kbytes, LMK minfree, governor tunables were overwritten by power HAL/lmkd after boot.
 
 ## Build #331
 
-### Performance Tuning: Hệ thống
-- **Tắt L2 Power Collapse**: wake latency 11ms → 240µs (msm8916-pm.dtsi, giảm jank sau idle)
-- **GPU idle timeout**: 80ms → 500ms (msm8916-gpu.dtsi, giữ GPU sẵn sàng lâu hơn)
-- **RCU_BOOST_DELAY**: 500ms → 100ms (defconfig, boost RCU callbacks nhanh hơn)
-- **extra_free_kbytes**: 0 → 16384 (delay_trigger, kswapd headroom chống direct reclaim stall)
+### Performance Tuning: System
+- **Disabled L2 Power Collapse**: wake latency 11ms → 240µs (msm8916-pm.dtsi, reduces jank after idle)
+- **GPU idle timeout**: 80ms → 500ms (msm8916-gpu.dtsi, keeps GPU ready longer)
+- **RCU_BOOST_DELAY**: 500ms → 100ms (defconfig, faster RCU callback processing)
+- **extra_free_kbytes**: 0 → 16384 (delay_trigger, kswapd headroom against direct reclaim stalls)
 - **Interactive governor tuning**: go_hispeed_load=75, min_sample_time=40ms, timer_rate=10ms, target_loads=80, io_is_busy=1, hispeed_freq=1497600
-- **LMK 2GB tuning**: minfree 7168,8192,11776,15360,18944,22528 pages (giết nền vừa phải)
+- **LMK 2GB tuning**: minfree 7168,8192,11776,15360,18944,22528 pages (moderate background killing)
 
 ## Build #330
 
@@ -50,8 +50,6 @@
 - Verified stable: stress test held 1.5 GHz, no CPR errors
 
 ## Builds #325-#327
-
-### DT2W Fix & Auto-Enable
 
 ### DT2W Fix & Auto-Enable
 - FIX: DT2W toggle wasn't applying immediately because `is_suspended` guard blocked I2C writes when screen on (build #325)
