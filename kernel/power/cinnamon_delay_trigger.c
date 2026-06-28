@@ -351,6 +351,13 @@ set_prop:
 		char *envp[] = {"PATH=/system/bin:/system/xbin", NULL};
 		call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT);
 	}
+
+	/* Reapply VM tunables after Android init overrode them */
+	cinnamon_write_path("/proc/sys/vm/extra_free_kbytes", "16384");
+	msleep(10);
+	cinnamon_write_path("/proc/sys/vm/swappiness", "80");
+	msleep(10);
+	cinnamon_write_path("/proc/sys/vm/vfs_cache_pressure", "50");
 }
 
 static void cinnamon_execute_command_3(void)
