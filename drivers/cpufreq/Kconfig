@@ -192,6 +192,19 @@ config CPU_FREQ_GOV_INTERACTIVE
 
 	  If in doubt, say N.
 
+config CPU_FREQ_GOV_SCHEDUTIL
+	tristate "'schedutil' cpufreq policy governor"
+	help
+	  'schedutil' - This driver adds a dynamic cpufreq policy governor
+	  based on scheduler utilization (UTIL_EST). The CPU frequency is
+	  scaled proportionally to the scheduler's estimated task demand,
+	  allowing more responsive frequency scaling than load-based governors.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called cpufreq_schedutil.
+
+	  If in doubt, say N.
+
 config CPU_FREQ_GOV_CONSERVATIVE
 	tristate "'conservative' cpufreq governor"
 	depends on CPU_FREQ

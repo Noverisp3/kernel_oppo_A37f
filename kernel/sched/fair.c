@@ -1245,6 +1245,25 @@ unsigned int max_task_load(void)
 	return sched_ravg_window;
 }
 
+/* Scale factor for sched_cpu_util() return value */
+#define SCHED_CAPACITY_SCALE 1024
+
+unsigned long sched_cpu_util(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	unsigned long util;
+	unsigned long max_load = max_task_load();
+
+	raw_spin_lock_irq(&rq->lock);
+	util = rq->cfs.util_est;
+	if (util > max_load)
+		util = max_load;
+	raw_spin_unlock_irq(&rq->lock);
+
+	return util * SCHED_CAPACITY_SCALE / max_load;
+}
+EXPORT_SYMBOL_GPL(sched_cpu_util);
+
 /*
  * UTIL_EST: Exponentially Weighted Moving Average (EWMA) of task utilization
  *

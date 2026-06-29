@@ -1,8 +1,16 @@
 # Cinnamon Kernel Changelog
 
-## Build #356 (Current)
+## Build #357 (Current)
 
-### UTIL_EST Backport + Scheduler Tuning + Undervolt (2026-06-29)
+### schedutil Governor + sched_cpu_util() (2026-06-29)
+
+- **schedutil governor**: New cpufreq governor that scales frequency proportionally to scheduler UTIL_EST demand (`kernel/sched/fair.c:1240`, `drivers/cpufreq/cpufreq_schedutil.c`). Maps utilization directly to frequency: `freq = max_freq * util / 1024`, replacing load-based heuristics with a direct scheduler-driven signal
+- **sched_cpu_util()**: Exported accessor returning per-CPU utilization (0-1024) based on aggregate `cfs_rq->util_est`, callable by cpufreq governors (`kernel/sched/fair.c:1247`)
+- **rate_limit_us**: Sysfs tunable at `/sys/devices/system/cpu/cpufreq/schedutil/rate_limit_us` (default 20ms, minimum 1ms)
+- **Schedutil is selectable** via `echo schedutil > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`
+- Build system: auto-accepts new config symbols via `make olddefconfig` in build.sh
+
+## Build #356
 
 - **UTIL_EST**: Exponentially Weighted Moving Average (EWMA) of task utilization, backported from Linux 7.2-rc1. Prevents frequency collapse during brief task sleeps (~100 lines, `kernel/sched/fair.c`)
 - **sched_min_granularity**: 750µs → **500µs** (runtime 1.5ms, 33% shorter time slices)
