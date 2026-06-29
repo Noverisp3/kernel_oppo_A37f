@@ -1,15 +1,5 @@
 # Cinnamon Kernel Changelog
 
-## Build #372
-
-### PLL config_ctl_val Experiment — CPU 1363 MHz (2026-06-29)
-
-- **Re-added CPU 1363 MHz** (corner 9) to PLL frequency table + DTS speed-bins
-- **PLL CONFIG_CTL register** (offset 0x14) now written during init: `.config_ctl_val = 0x000D6968` (reference from SR2 PLL on SD 810) — previously this register was never touched for a53sspll (NULL pointer defaulted to PLL_MODE write)
-- Updated CPR: corner map, frequency map, speed-bin-max-corners, voltage adjustment array (all +1 entry)
-- Bus bandwidth + cpufreq table updated for 1363 MHz
-- **Uncertain**: VCO may still fail to lock if config_ctl_val is wrong — test required
-
 ## Build #370–#371
 
 ### Interactive Governor Tuning + I2C 1MHz (2026-06-29)

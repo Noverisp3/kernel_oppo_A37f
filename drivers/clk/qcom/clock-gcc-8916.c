@@ -345,7 +345,6 @@ static struct pll_freq_tbl apcs_pll_freq[] = {
 	F_APCS_PLL(1152000000, 60, 0x0, 0x1, 0x0, 0x0, 0x0),
 	F_APCS_PLL(1190400000, 62, 0x0, 0x1, 0x0, 0x0, 0x0),
 	F_APCS_PLL(1209600000, 63, 0x0, 0x1, 0x0, 0x0, 0x0),
-	F_APCS_PLL(1363200000, 71, 0x0, 0x1, 0x0, 0x0, 0x0),
 	PLL_F_END
 };
 
@@ -355,12 +354,8 @@ static struct pll_clk a53sspll = {
 	.m_reg = (void __iomem *)APCS_SH_PLL_M_VAL,
 	.n_reg = (void __iomem *)APCS_SH_PLL_N_VAL,
 	.config_reg = (void __iomem *)APCS_SH_PLL_USER_CTL,
-	.config_ctl_reg = (void __iomem *)APCS_SH_PLL_CONFIG_CTL,
 	.status_reg = (void __iomem *)APCS_SH_PLL_STATUS,
 	.freq_tbl = apcs_pll_freq,
-	.vals = {
-		.config_ctl_val = 0x000D6968,
-	},
 	.masks = {
 		.vco_mask = BM(29, 28),
 		.pre_div_mask = BIT(12),
