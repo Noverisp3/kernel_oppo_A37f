@@ -16,6 +16,9 @@ git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86
 
 make O=out ARCH=arm64 cinnamon_A37f_defconfig
 
+# Accept defaults for any new config symbols
+make O=out ARCH=arm64 olddefconfig 2>/dev/null || true
+
 PATH="$tcdir/los-4.9-64/bin:$tcdir/los-4.9-32/bin:${PATH}" \
 make    O=out \
         ARCH=arm64 \
