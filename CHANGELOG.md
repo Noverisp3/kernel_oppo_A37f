@@ -1,6 +1,22 @@
 # Cinnamon Kernel Changelog
 
-## Build #370–#371
+## Build #372–#374 — Reverted
+
+### PLL config_ctl_val Experiment — Failed (2026-06-29)
+
+**Attempt:** CPU 1363 MHz via PLL CONFIG_CTL register (offset 0x14) with `config_ctl_val = 0x000D6968` (Snapdragon 810 SR2 PLL reference).
+
+**Problem found:** `__variable_rate_pll_init` never called for SR2 PLL type — config_ctl_val not written to hardware. Fixed by adding init to `local_pll_clk_set_rate`.
+
+**Result:**
+- Config_ctl_val now takes effect (confirmed by performance change)
+- 1363 MHz: **1106 ev/s** (half of 1209 MHz baseline) — wrong VCO settings corrupt PLL
+- 1209 MHz: -6% regression (2144 ev/s) from init's USER_CTL side effects
+- Writing 0 to CONFIG_CTL → **bootloop** (PLL needs valid analog config)
+
+**Conclusion:** SR2 PLL VCO on 28nm LP is physically capped at ~1.2 GHz. No software PLL tuning can extend this.
+
+**Revert:** All changes reverted in commit `e453afbfc4d`.
 
 ### Interactive Governor Tuning + I2C 1MHz (2026-06-29)
 
