@@ -65,8 +65,8 @@ enum sched_tunable_scaling sysctl_sched_tunable_scaling
  * Minimal preemption granularity for CPU-bound tasks:
  * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_min_granularity = 750000ULL;
-unsigned int normalized_sysctl_sched_min_granularity = 750000ULL;
+unsigned int sysctl_sched_min_granularity = 500000ULL;
+unsigned int normalized_sysctl_sched_min_granularity = 500000ULL;
 
 /*
  * is kept at sysctl_sched_latency / sysctl_sched_min_granularity
@@ -95,8 +95,8 @@ unsigned int __read_mostly sysctl_sched_wake_to_idle;
  * and reduces their over-scheduling. Synchronous workloads will still
  * have immediate wakeup/sleep latencies.
  */
-unsigned int sysctl_sched_wakeup_granularity = 1000000UL;
-unsigned int normalized_sysctl_sched_wakeup_granularity = 1000000UL;
+unsigned int sysctl_sched_wakeup_granularity = 250000UL;
+unsigned int normalized_sysctl_sched_wakeup_granularity = 250000UL;
 
 const_debug unsigned int sysctl_sched_migration_cost = 500000UL;
 
@@ -1243,6 +1243,130 @@ unsigned int max_task_load(void)
 		return LOAD_AVG_MAX;
 
 	return sched_ravg_window;
+}
+
+/*
+ * UTIL_EST: Exponentially Weighted Moving Average (EWMA) of task utilization
+ *
+ * When a task dequeues while going to sleep, its utilization is stored in an
+ * EWMA that decays slowly. This prevents the CPU frequency from collapsing
+ * during brief idle periods (e.g., between user input events), reducing
+ * jank/lag.
+ *
+ * The EWMA uses a weight of 0.25 (1 >> UTIL_EST_WEIGHT_SHIFT) for new
+ * samples, so recent activations have a moderate influence on the estimate.
+ */
+#define UTIL_EST_WEIGHT_SHIFT	2
+#define UTIL_AVG_UNCHANGED	0x80000000
+
+/*
+ * _task_util_est - return the raw estimated utilization (masking flag bit)
+ */
+static inline unsigned int _task_util_est(struct task_struct *p)
+{
+	return p->util_est & ~UTIL_AVG_UNCHANGED;
+}
+
+/*
+ * task_util_est - return max of current load and estimated utilization
+ *
+ * This is the value that should be used for frequency scaling decisions:
+ * it never drops below the EWMA estimate, preventing frequency collapse
+ * during brief idle periods.
+ */
+static inline unsigned int task_util_est(struct task_struct *p)
+{
+	return max(task_load(p), _task_util_est(p));
+}
+
+/*
+ * util_est_update - update the task's estimated utilization EWMA
+ *
+ * Called when a task dequeues while going to sleep. The EWMA is:
+ *   ewma(t) = w * current_load + (1-w) * ewma(t-1)
+ * where w = 1 >> UTIL_EST_WEIGHT_SHIFT = 0.25
+ *
+ * On utilization increases, the EWMA is reset to the current value.
+ */
+static inline void util_est_update(struct task_struct *p)
+{
+	unsigned int ewma, dequeued, last_ewma_diff;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	ewma = ACCESS_ONCE(p->util_est);
+
+	/*
+	 * If the task's load hasn't been updated since the last enqueue,
+	 * skip the update to avoid basing the EWMA on stale data.
+	 */
+	if (ewma & UTIL_AVG_UNCHANGED)
+		return;
+
+	/* Get the current load at dequeue time */
+	dequeued = task_load(p);
+
+	/*
+	 * Reset EWMA on utilization increases. The moving average is used
+	 * only to smooth utilization decreases.
+	 */
+	if (ewma <= dequeued) {
+		ewma = dequeued;
+		goto done;
+	}
+
+	/*
+	 * Update Task's estimated utilization (EWMA):
+	 *   ewma(t) = w * task_load(p) + (1-w) * ewma(t-1)
+	 *   ewma(t) = ewma(t-1) - w * (ewma(t-1) - task_load(p))
+	 *   ewma(t) = ewma(t-1) - (ewma - dequeued) >> 2
+	 */
+	last_ewma_diff = ewma - dequeued;
+	ewma <<= UTIL_EST_WEIGHT_SHIFT;
+	ewma -= last_ewma_diff;
+	ewma >>= UTIL_EST_WEIGHT_SHIFT;
+done:
+	/* Set the UNCHANGED flag so next enqueue must clear it */
+	ewma |= UTIL_AVG_UNCHANGED;
+	ACCESS_ONCE(p->util_est) = ewma;
+}
+
+/*
+ * util_est_enqueue - add task's estimated utilization to cfs_rq
+ *
+ * Called when a task is enqueued. Adds the task's UTIL_EST to the
+ * cfs_rq aggregate and clears the UNCHANGED flag so the next
+ * util_est_update on dequeue will be processed.
+ */
+static inline void util_est_enqueue(struct cfs_rq *cfs_rq,
+				    struct task_struct *p)
+{
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	/* Clear flag so next dequeue's util_est_update is not skipped */
+	p->util_est &= ~UTIL_AVG_UNCHANGED;
+
+	/* Add this task's estimated utilization to the cfs_rq aggregate */
+	cfs_rq->util_est += _task_util_est(p);
+}
+
+/*
+ * util_est_dequeue - remove task's estimated utilization from cfs_rq
+ *
+ * Called when a task is dequeued. Subtracts the task's UTIL_EST from
+ * the cfs_rq aggregate.
+ */
+static inline void util_est_dequeue(struct cfs_rq *cfs_rq,
+				    struct task_struct *p)
+{
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	/* Remove this task's estimated utilization from the cfs_rq aggregate */
+	cfs_rq->util_est -= min_t(unsigned int, cfs_rq->util_est,
+				  _task_util_est(p));
 }
 
 /* Use this knob to turn on or off HMP-aware task placement logic */
@@ -3155,7 +3279,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 		 * for a gentler effect of sleepers:
 		 */
 		if (sched_feat(GENTLE_FAIR_SLEEPERS))
-			thresh >>= 1;
+			thresh >>= 2;
 
 		vruntime -= thresh;
 	}
@@ -3181,6 +3305,8 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	update_curr(cfs_rq);
 	enqueue_entity_load_avg(cfs_rq, se, flags & ENQUEUE_WAKEUP);
+	if (entity_is_task(se))
+		util_est_enqueue(cfs_rq, task_of(se));
 	account_entity_enqueue(cfs_rq, se);
 	update_cfs_shares(cfs_rq);
 
@@ -3256,6 +3382,11 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	update_curr(cfs_rq);
 	dequeue_entity_load_avg(cfs_rq, se, flags & DEQUEUE_SLEEP);
+	if (entity_is_task(se)) {
+		util_est_dequeue(cfs_rq, task_of(se));
+		if (flags & DEQUEUE_SLEEP)
+			util_est_update(task_of(se));
+	}
 
 	update_stats_dequeue(cfs_rq, se);
 	if (flags & DEQUEUE_SLEEP) {

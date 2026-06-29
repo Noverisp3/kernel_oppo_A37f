@@ -245,6 +245,9 @@ struct cfs_bandwidth { };
 struct cfs_rq {
 	struct load_weight load;
 	unsigned int nr_running, h_nr_running;
+#ifdef CONFIG_SCHED_HMP
+	unsigned int util_est;
+#endif
 
 	u64 exec_clock;
 	u64 min_vruntime;

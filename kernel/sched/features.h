@@ -70,3 +70,11 @@ SCHED_FEAT(LB_MIN, false)
 SCHED_FEAT(NUMA,	false)
 SCHED_FEAT(NUMA_FORCE,	false)
 #endif
+
+/*
+ * UtilEst: Exponentially Weighted Moving Average (EWMA) of task utilization.
+ * When a task goes to sleep, its utilization is stored in an EWMA that decays
+ * slowly. This prevents the CPU frequency from collapsing during brief idle
+ * periods (e.g., between user input events), reducing jank/lag.
+ */
+SCHED_FEAT(UTIL_EST, true)

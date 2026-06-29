@@ -1,6 +1,26 @@
 # Cinnamon Kernel Changelog
 
-## Build #351 (Current)
+## Build #356 (Current)
+
+### UTIL_EST Backport + Scheduler Tuning + Undervolt (2026-06-29)
+
+- **UTIL_EST**: Exponentially Weighted Moving Average (EWMA) of task utilization, backported from Linux 7.2-rc1. Prevents frequency collapse during brief task sleeps (~100 lines, `kernel/sched/fair.c`)
+- **sched_min_granularity**: 750µs → **500µs** (runtime 1.5ms, 33% shorter time slices)
+- **sched_wakeup_granularity**: 1ms → **250µs** (runtime 750µs, 4x faster wakeup preemption)
+- **GENTLE_FAIR_SLEEPERS**: thresh >>=1 → **>>=2** (50% less sleeper credit, fairer scheduling)
+- **CPU undervolt**: -25mV → **-50mV** on corners 3-8 (533-1209 MHz)
+
+## Build #355
+
+## Build #354
+
+- **Removed fake CPU frequencies 1363 MHz and 1497 MHz** from `apcs_pll_freq[]`, DTS speed-bin tables, cpufreq-table, cpu-to-dev-map, and CPR corner map
+- **Confirmed**: VCO=1 writes correctly (bit 28=1 in USER register) but PLL physically caps at ~1.2 GHz — CPU performance identical at 998, 1209, 1497 MHz (sysbench: ~1480 ev/s)
+- **Max CPU frequency**: 1209600 kHz (corner 8)
+- **GPU OC 620 MHz** preserved: uses RCG mux+divider from GPLL2, different mechanism from CPU PLL, likely real
+- Updated hispeed_freq from 1497600 → 1209600
+
+## Build #351
 
 ### Adreno Idler + Wakelock Blocker (2026-06-28)
 
@@ -13,18 +33,18 @@
 
 ### Dynamic Fsync (2026-06-28)
 
-- **vfs_fsync_range hook**: `/proc/dynamic_fsync` (1=skip fsync, 0=normal). Pin > 30% và không sạc → skip fsync (I/O nhanh hơn). Pin ≤ 30% hoặc đang sạc → fsync bình thường (an toàn dữ liệu)
-- Cinnamon_Active monitor battery mỗi 60s, tự động bật/tắt theo dung lượng pin
+- **vfs_fsync_range hook**: `/proc/dynamic_fsync` (1=skip fsync, 0=normal). Battery > 30% and not charging → skip fsync (faster I/O). Battery ≤ 30% or charging → normal fsync (data safe)
+- Cinnamon_Active monitors battery every 60s, auto-toggles based on capacity
 - Safe design: re-enables fsync on low battery, charging, or suspend
 
 ## Build #349
 
 ### TCP Westwood+ (2026-06-28)
 
-- **TCP Westwood+** enabled as default congestion control (thay CUBIC). Bandwidth estimation, phù hợp WiFi/mobile hơn (không giảm tốc do nhiễu sóng)
+- **TCP Westwood+** enabled as default congestion control (replaces CUBIC). Bandwidth estimation, better suited for WiFi/mobile (no slowdown from signal noise)
 - Available: westwood, reno, bic, cubic, htcp
 - Localversion: `-lineageos` → `-cinnamon`
-- `lineageos_a37f_defconfig` removed, chỉ còn `cinnamon_A37f_defconfig`
+- `lineageos_a37f_defconfig` removed, only `cinnamon_A37f_defconfig`
 
 ## Build #346
 
@@ -39,7 +59,7 @@
 ### Panel Overclock 65fps + Touch Boost
 
 - **Panel 60→65fps**: pclk=89,202,880 Hz, DSI VCO=356,811,520 Hz, bit clock=714 MHz (+6.6%). Modified BOE ILI9881C, TM NT35521S, Truly NT35521S panels. Reduced VBP/VFP
-- **Fix**: removed `cont-splash-enabled` từ panel DTS (blocking DTS timing)
+- **Fix**: removed `cont-splash-enabled` from panel DTS (blocking DTS timing)
 - **Touch I2C 400kHz**: QUP5 bus 100kHz→400kHz
 - **Synaptics**: `nosleep=1`, `report_rate=1` in wake function
 - LM3630 PWM backlight: I2C dimming mode, `pwm-active=0`, PWM frequency hardware-fixed
@@ -48,11 +68,11 @@
 
 ### BIMC Clock OC Attempt (Abandoned)
 
-- `of_clk_get_from_provider()` với `qcom,rpmcc-8916` DT node thành công (build #341)
-- `clk_round_rate(600MHz)=600MHz`, `clk_set_rate` trả về success
-- **Nhưng**: hardware vẫn 533 MHz — RPM firmware black box rejects higher rate votes
+- `of_clk_get_from_provider()` with `qcom,rpmcc-8916` DT node succeeded (build #341)
+- `clk_round_rate(600MHz)=600MHz`, `clk_set_rate` returned success
+- **But**: hardware still at 533 MHz — RPM firmware black box rejects higher rate votes
 - BIMC timing registers S_SCMO at TrustZone locked — writes cause crash (build #342–#343, reverted)
-- **Kết luận**: DDR không thể OC trên MSM8916
+- **Conclusion**: DDR cannot be overclocked on MSM8916
 
 ## Builds #338–#339
 
@@ -73,8 +93,8 @@
 ### Defconfig Cleanup
 
 - Removed ~115 unnecessary config options: unused filesystems (btrfs, nilfs, jfs...), unused crypto algorithms (serpent, twofish, blowfish, camellia...), unused network protocols (DCCP, SCTP, DECnet, IPX, AppleTalk...), unused drivers (ISDN, telephony, WAN, CAN...)
-- Cleaned DTS directory: chỉ giữ `cinnamon_A37f_defconfig` và 32 msm8916 DTS files
-- Removed `CONFIG_MSM_FED` (tăng tốc panic)
+- Cleaned DTS directory: kept only `cinnamon_A37f_defconfig` and 32 msm8916 DTS files
+- Removed `CONFIG_MSM_FED` (faster panic)
 
 ## Build #333
 
@@ -193,6 +213,6 @@
 ## Pending Ideas
 - USB Fast Charge
 - OverlayFS for Docker in chroot
-- Sound Control (faux, tăng max volume)
+- Sound Control (faux, increase max volume)
 - ZRAM 1GB + lz4/zstd
 - Input boost duration 40ms→80ms
