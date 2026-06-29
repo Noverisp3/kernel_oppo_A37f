@@ -1,5 +1,13 @@
 # Cinnamon Kernel Changelog
 
+## Build #376
+
+### eMMC HS400 + SD Card DDR50 (2026-06-29)
+
+- **eMMC (sdhc_1):** Added `HS400_1p8v` bus-speed-mode + 200 MHz clock rate. HS400 doubles eMMC throughput vs HS200 at same clock.
+- **SD card (sdhc_2):** Added `DDR_1p8v` bus-speed-mode enabling UHS DDR50 (50 MB/s vs base 25 MB/s SDR).
+- Hardware will fall back to supported mode if the new modes fail.
+
 ## Build #372–#374 — Reverted
 
 ### PLL config_ctl_val Experiment — Failed (2026-06-29)
