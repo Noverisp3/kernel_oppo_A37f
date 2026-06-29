@@ -103,7 +103,9 @@
 	};
 
 	i2c@78b9000 { /* BLSP1 QUP5 */
-		qcom,clk-freq-out = <400000>;
+		qcom,clk-freq-out = <1000000>;
+		qcom,fs-clk-div = <8>;
+		qcom,high-time-clk-div = <5>;
 	};
 
 	qcom,opponvbk_sharedmem@0x85f00000 {

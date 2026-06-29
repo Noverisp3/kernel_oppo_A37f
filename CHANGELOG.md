@@ -1,14 +1,44 @@
 # Cinnamon Kernel Changelog
 
-## Build #357 (Current)
+## Build #370–#371
 
-### schedutil Governor + sched_cpu_util() (2026-06-29)
+### Interactive Governor Tuning + I2C 1MHz (2026-06-29)
 
-- **schedutil governor**: New cpufreq governor that scales frequency proportionally to scheduler UTIL_EST demand (`kernel/sched/fair.c:1240`, `drivers/cpufreq/cpufreq_schedutil.c`). Maps utilization directly to frequency: `freq = max_freq * util / 1024`, replacing load-based heuristics with a direct scheduler-driven signal
-- **sched_cpu_util()**: Exported accessor returning per-CPU utilization (0-1024) based on aggregate `cfs_rq->util_est`, callable by cpufreq governors (`kernel/sched/fair.c:1247`)
-- **rate_limit_us**: Sysfs tunable at `/sys/devices/system/cpu/cpufreq/schedutil/rate_limit_us` (default 20ms, minimum 1ms)
-- **Schedutil is selectable** via `echo schedutil > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`
-- Build system: auto-accepts new config symbols via `make olddefconfig` in build.sh
+- **Interactive governor tuned** for faster ramp-up and UI smoothness:
+  - `go_hispeed_load`: 90 → **75** (boost sooner)
+  - `hispeed_freq`: 998400 → **1209600** (boost straight to max)
+  - `min_sample_time`: 50ms → **30ms** (faster freq step-down)
+  - `timer_rate`: 30ms → **20ms** (more frequent eval)
+  - `above_hispeed_delay`: 25ms → **20ms**
+  - `boostpulse_duration`: 60ms → **80ms** (longer touch boost)
+  - `target_loads`: more aggressive curve (200MHz:37→25, ... 1209MHz:90→80)
+  - Persisted via 120s reapply work (survives Android power HAL override)
+- **I2C touch bus (QUP5)**: 400kHz → **1MHz** (`msm8916-common-15399.dtsi:105`). Driver already supports 1MHz divider table — only DTS change needed
+- Sysbench CPU: 2286 → **2373 ev/s** (+3.8%)
+
+## Build #368–#357 (Reverted)
+
+### schedutil Governor Experiment — Reverted (2026-06-29)
+
+**schedutil governor backported** from mainline concept. Uses scheduler UTIL_EST demand → frequency: `freq = max_freq * util / 1024`.
+
+**Problems discovered:**
+- **sleeping-in-softirq**: `__cpufreq_driver_target()` may sleep (mutex) → called directly from timer softirq → BUG splat. Fixed with workqueue deferral.
+- **cpufreq sysfs hang**: `del_timer_sync()` on BSS-zeroed uninitialized timer (`timer->base = NULL`) → `spin_lock_irqsave(0)` infinite spin. Fixed by initializing timer before GOV_START.
+- **UTIL_EST = 0 for CPU-bound tasks**: Tasks that never sleep have zero UTIL_EST → governor selects `policy->min` (200 MHz). Added `nr_running` fallback → per-CPU `nr_running=1` maps to only 25% max → still too slow.
+- **schedule_work_on() starvation**: Work queued on busy CPU never runs → frequency never updates. Fixed with unbound `schedule_work()`.
+- **Still 3× slower than interactive** (805 vs 2362 ev/s sysbench) even after all fixes.
+
+**Root cause**: UTIL_EST only updates on task sleep/wake. CPU-bound workloads never sleep → zero signal. The HMP scheduler has no PELT-like continuous load tracking → any frequency scaling based on UTIL_EST is fundamentally broken for compute-bound tasks on this kernel.
+
+**Conclusion**: schedutil cannot replace interactive on this kernel without backporting full PELT (thousands of lines). **Reverted to interactive governor** as default. schedutil remains available as an opt-in for testing.
+
+### What's left in the code:
+- `CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y` stays enabled
+- schedutil governor module remains compiled
+- `sched_cpu_util()` function stays exported for future use
+- **Default governor remains `interactive`**
+- Switch manually: `echo schedutil > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`
 
 ## Build #356
 

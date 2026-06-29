@@ -366,6 +366,25 @@ set_prop:
 	cinnamon_write_path("/proc/sys/vm/vfs_cache_pressure", "50");
 	msleep(10);
 	cinnamon_write_path("/proc/sys/net/ipv4/tcp_congestion_control", "westwood");
+
+	/* Reapply interactive governor tunings after Android power HAL override */
+	msleep(10);
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load", "75");
+	msleep(10);
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "1209600");
+	msleep(10);
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "30000");
+	msleep(10);
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/timer_rate", "20000");
+	msleep(10);
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/timer_slack", "20000");
+	msleep(10);
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay", "20000");
+	msleep(10);
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration", "80000");
+	msleep(10);
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/target_loads",
+		"1 200000:25 400000:35 533333:45 800000:55 998400:60 1094400:65 1152000:70 1209600:80");
 }
 
 static void cinnamon_try_bimc_oc(void)
