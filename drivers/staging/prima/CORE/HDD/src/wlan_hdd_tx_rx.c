@@ -500,9 +500,26 @@ void hdd_mon_tx_work_queue(struct work_struct *work)
 
 int hdd_mon_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+   hdd_adapter_t *pMonAdapter = WLAN_HDD_GET_PRIV_PTR(dev);
+   hdd_context_t *pHddCtx;
+   hdd_adapter_t *pStaAdapter;
+
+   printk(KERN_INFO "hdd_mon_hard_start_xmit: called len=%d\n", skb->len);
+
+   pHddCtx = WLAN_HDD_GET_CTX(pMonAdapter);
+   if (pHddCtx) {
+      pStaAdapter = hdd_get_adapter(pHddCtx, WLAN_HDD_INFRA_STATION);
+      if (pStaAdapter && pStaAdapter->dev) {
+         skb->dev = pStaAdapter->dev;
+         printk(KERN_INFO "hdd_mon_hard_start_xmit: redirecting to wlan0\n");
+         return hdd_hard_start_xmit(skb, pStaAdapter->dev);
+      }
+   }
+
    VOS_TRACE( VOS_MODULE_ID_HDD_DATA, VOS_TRACE_LEVEL_ERROR,
            "%s: Packet Rcvd at Monitor interface,"
              " Dropping the packet",__func__);
+   printk(KERN_INFO "hdd_mon_hard_start_xmit: dropping packet\n");
    kfree_skb(skb);
    return NETDEV_TX_OK;
 }

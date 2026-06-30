@@ -1,5 +1,18 @@
 # Cinnamon Kernel Changelog
 
+## Builds #387–#388
+
+### Monitor TX Injection Test — Redirect mon0 → wlan0 hdd_hard_start_xmit (2026-06-30)
+
+- **Build #387:** Modified `hdd_mon_hard_start_xmit` (`wlan_hdd_tx_rx.c:501`) to redirect packets through wlan0's STA TX path instead of dropping them
+- **Build #388:** Added `printk` debug to confirm the redirect path is hit
+- **Test results:** No WMI raw/injection commands exist in the driver (`CORE/WMI/` directory doesn't exist, no `wlan_hal_msg.h` has raw TX message types beyond `WLAN_HAL_ENABLE_MONITOR_MODE_REQ/RSP` 302-303)
+- `hdd_mon_hard_start_xmit` redirect path confirmed working via dmesg: `redirecting to wlan0` logged
+- wlan0 TX counters incremented by exactly 5×60=300 bytes for 5 test packets sent through mon0 via AF_PACKET socket
+- No firmware crash observed — **Kịch bản B confirmed**: firmware silently accepts redirected packets through STA data path
+- **However:** Not true raw injection — packets go through normal STA TX path, encrypted with PTK, source MAC overwritten by firmware. Deauth/disassoc injection not possible
+- **Conclusion:** Firmware can send arbitrary data payloads as encrypted STA data frames, but cannot inject raw 802.11 management frames. For WPA handshake capture, need alternative approach (EAPOL sniffer in wlan0 RX path)
+
 ## Builds #385–#386
 
 ### Monitor Mode Stability Fixes — TX Watchdog, Notifier, WCNSS Crash (2026-06-30)
