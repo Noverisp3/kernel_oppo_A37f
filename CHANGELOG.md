@@ -1,5 +1,15 @@
 # Cinnamon Kernel Changelog
 
+## Build #376 — Reverted
+
+### eMMC HS400 + SD Card DDR50 — Failed (2026-06-30)
+
+**Attempt:** eMMC HS400/200 MHz + SD card DDR50 via DTS `bus-speed-mode` and `clk-rates`.
+
+**Result:** Bootloop — MSM8916 SDHCI controller can't handle HS400 or 200 MHz on this board.
+
+**Revert:** commit `9e1a3dcfffe`.
+
 ## Build #372–#374 — Reverted
 
 ### PLL config_ctl_val Experiment — Failed (2026-06-29)
