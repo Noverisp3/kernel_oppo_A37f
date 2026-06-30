@@ -1,20 +1,39 @@
 # Cinnamon Kernel Changelog
 
-## Build #379
+## Builds #385–#386
 
-### WLAN Monitor Mode — Full Driver Support (2026-06-30)
+### Monitor Mode Stability Fixes — TX Watchdog, Notifier, WCNSS Crash (2026-06-30)
 
-- **Standalone monitor mode:** Removed STA requirement in `wlan_hdd_add_monitor_check()` — now allows 0 or 1 STA interfaces
-- **Forced FW capability bit:** `setFeatCaps(gpFwWlanFeatCaps, STA_MONITOR_SCC)` in `WDI_ProcessFeatureCapsExchangeRsp()` to make host think FW supports it
-- **cfg80211 set_channel for MONITOR:** Added `WLAN_HDD_MONITOR` case in `__wlan_hdd_cfg80211_set_channel()` that:
-  - Updates monitor context with channel, BW=20, CRC=off, all frame types
-  - Sets `dev->type = ARPHRD_IEEE80211_RADIOTAP`
-  - Sets `pMonCtx->state = MON_MODE_START`
-  - Sends `WDA_MON_START_REQ` to firmware via `wlan_hdd_mon_postMsg()`
-  - Waits up to 5s for firmware response
-  - Enables carrier on success
-- **Standalone open fix:** `__hdd_mon_open()` now sets `DEVICE_IFACE_OPENED` even when not in `VOS_STA_MON` mode
-- Usage: `iw phy phy0 interface add mon0 type monitor && ifconfig mon0 up && iw dev mon0 set freq 2412 && tcpdump -i mon0`
+- **Build #386:** Fixed notifier skip for mon\* interfaces — added separate early-return instead of nesting inside wlan/p2p condition
+- **Fixed NETDEV WATCHDOG:** `netif_tx_start_all_queues()` instead of `netif_start_queue()` — `NUM_TX_QUEUES = 5` (WMM AC queues 0-4), single queue start leaves queues 1-4 unserviced → watchdog fires
+- **Build #385:** Fixed VOS_ASSERT in netdev notifier — early return for `mon*` interfaces. VOS_ASSERT is `WARN_ON(1)` (cosmetic only, doesn't block anything)
+- **Build #384:** Fixed WCNSS firmware crash on `iw dev mon0 del` — removed `WDA_MON_STOP_REQ` from `wlan_hdd_stop_mon()`. Stops monitor mode locally (set `state = MON_MODE_STOP`, re-enable BMPS/IMPS) without sending HAL command to firmware
+- **Verified:** multiple create/delete cycles work reliably without crash
+
+## Build #383
+
+### Monitor Mode RX Path Fix — STA Coexistence via skb_copy (2026-06-30)
+
+- **Fixed STA+MON co-existence:** Instead of `vos_pkt_set_os_packet()` (which rejects RX packet types), use `vos_pkt_get_os_packet(pVosPacket, &skb, VOS_FALSE)` to peek at skb without clearing it, then `skb_copy` to create independent copy for mon0
+- STA path gets original skb untouched (0% packet loss verified), mon0 gets the copy with radiotap header
+- Fixed typo `VOS_STATUS_E_SUCCESS` → `VOS_STATUS_SUCCESS`
+- **Verified:** STA 0% ping loss while mon0 captures 50+ frames with radiotap
+
+## Builds #379–#382
+
+### WLAN Monitor Mode — Driver-Side Implementation (2026-06-30)
+
+- **Standalone monitor mode:** Removed STA requirement in `wlan_hdd_add_monitor_check()` — now allows 0 or 1 STA interfaces (Build #378)
+- **Forced FW capability bit:** `setFeatCaps(gpFwWlanFeatCaps, STA_MONITOR_SCC)` in `WDI_ProcessFeatureCapsExchangeRsp()` (Build #378)
+- **Build #379:** `wlan_hdd_cfg80211_set_monitor_channel()` callback registered in cfg80211 ops, `WDA_MON_START_REQ` posted to firmware, waits 5s for response. `set freq` succeeds (`-EOPNOTSUPP` was for kernel ≥ 3.6)
+- **Build #380:** Added monitor channel callback; `cfg80211_has_monitors_only` check removed from `cfg80211_set_monitor_channel()`. `set freq` succeeds but `WDA_MON_START_REQ` times out
+- **Build #381:** Fixed `wlan_hdd_check_monitor_state()` + TL RX path for STA+MON (don't `continue` after monitor callback). Firmware still crashed — `wcnss` fatal error when `WDA_MON_START_REQ` sent
+- **Build #382:** Removed `WDA_MON_START_REQ` — sets `state = MON_MODE_START` locally. Captured 10 frames with radiotap. STA data loss because `vos_pkt_set_os_packet()` rejects RX packet types
+- **Key discovery:** WCNSS PIL blob (Cortex-R4/R5) doesn't implement `WLAN_HAL_ENABLE_MONITOR_MODE_REQ` (msgType 302) — sending it causes firmware crash/reboot. **All firmware HAL commands abandoned** in favor of local-only monitor mode
+- **RX path architecture:** `WLANTL_RxFrames()` → calls both `WLANTL_HandleMonModeDataFrame()` and STA delivery. Monitor callback at `hdd_rx_packet_monitor_cbk()` delivers 802.11 + radiotap frame to mon0 via `netif_rx()`
+- **hdd_mon_hard_start_xmit:** drops all TX (`kfree_skb(skb)` + `NETDEV_TX_OK`) — no injection support without firmware changes
+- **Usage:** `iw phy phy0 interface add mon0 type monitor && ifconfig mon0 up && iw dev mon0 set freq 2412 && tcpdump -i mon0`
+- **`airodump-ng mon0` works** in Debian chroot (SSH root@192.168.0.101) — captures AP "Nguyen T3" (WPA2, CH 10, -54 dBm) with station A8:1B:5A:19:00:AB, 6741 frames seen
 
 ## Build #378
 
