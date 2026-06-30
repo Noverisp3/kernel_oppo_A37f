@@ -21515,7 +21515,7 @@ static int wlan_hdd_cfg80211_set_monitor_channel(struct wiphy *wiphy,
 
     pMonCtx->state = MON_MODE_START;
     netif_carrier_on(pAdapter->dev);
-    netif_start_queue(pAdapter->dev);
+    netif_tx_start_all_queues(pAdapter->dev);
 
     hddLog(VOS_TRACE_LEVEL_INFO_HIGH,
            "%s: monitor mode started on channel %d", __func__, channel);
