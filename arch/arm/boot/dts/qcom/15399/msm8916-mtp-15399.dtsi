@@ -415,9 +415,6 @@
 
 	qcom,nonremovable;
 
-	qcom,bus-speed-mode = "HS200_1p8v", "DDR_1p8v", "HS400_1p8v";
-	qcom,clk-rates = <400000 25000000 50000000 100000000 177770000 200000000>;
-
 	status = "ok";
 };
 
@@ -447,8 +444,6 @@
 	interrupt-names = "hc_irq", "pwr_irq", "status_irq";
 	/delete-property/ cd-gpios;
 	cd-gpios = <&msm_gpio 38 0>;
-
-	qcom,bus-speed-mode = "DDR_1p8v";
 
 	status = "ok";
 };
