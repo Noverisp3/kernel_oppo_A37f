@@ -6177,8 +6177,11 @@ static bool WLANTL_StaMonRX(WLANTL_CbType* pTLCb, vos_pkt_t *pFrame,
    v_MACADDR_t *peerMacAddr = NULL;
    uint8_t i = 0;
 
-   if (vos_check_monitor_state() == false || WLANTL_STA_ID_MONIFACE(sta_id) == 0)
+   if (vos_check_monitor_state() == false)
       return false;
+
+   if (WLANTL_STA_ID_MONIFACE(sta_id) == 0)
+      return true;
 
    pHdr = (tpSirMacMgmtHdr)pRxMetadata->mpduHeaderPtr;
 
@@ -6347,7 +6350,7 @@ WLANTL_RxFrames
 
     sta_mon_data = WLANTL_StaMonRX(pTLCb, vosTempBuff, pvBDHeader, ucSTAId);
 
-    if (vos_get_conparam() == VOS_MONITOR_MODE || sta_mon_data)
+    if (vos_get_conparam() == VOS_MONITOR_MODE)
     {
         sta_mon_data = false;
 
@@ -6357,6 +6360,12 @@ WLANTL_RxFrames
         pTLCb->pfnMonRx(pvosGCtx, vosTempBuff, pTLCb->isConversionReq);
         vosTempBuff = vosDataBuff;
         continue;
+    }
+    else if (sta_mon_data)
+    {
+        sta_mon_data = false;
+
+        pTLCb->pfnMonRx(pvosGCtx, vosTempBuff, pTLCb->isConversionReq);
     }
 
     /*---------------------------------------------------------------------
@@ -8723,7 +8732,7 @@ WLANTL_STATxAuth
 
   /* This code is to send traffic with lower priority AC when we does not 
      get admitted to send it. Today HAL does not downgrade AC so this code 
-     does not get executed.(In other words, HAL doesn’t change tid. The if 
+     does not get executed.(In other words, HAL doesnï¿½t change tid. The if 
      statement is always false.)
      NOTE: In the case of LA downgrade occurs in HDD (that was the change 
      Phani made during WMM-AC plugfest). If WM & BMP also took this approach, 

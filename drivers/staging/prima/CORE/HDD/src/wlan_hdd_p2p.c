@@ -2189,7 +2189,7 @@ static int
 wlan_hdd_add_monitor_check(hdd_context_t *hdd_ctx, hdd_adapter_t **adapter,
 			   enum nl80211_iftype type, const char *name)
 {
-	hdd_adapter_t *sta_adapter;
+	hdd_adapter_t *sta_adapter = NULL;
 	hdd_adapter_t *mon_adapter;
 	uint32_t i;
 
@@ -2197,17 +2197,10 @@ wlan_hdd_add_monitor_check(hdd_context_t *hdd_ctx, hdd_adapter_t **adapter,
 
 	/*
 	 * If add interface request is for monitor mode, then it can run in
-	 * parallel with only one station interface.
-	 * If there is no existing station interface return error
+	 * parallel with only one station interface, or standalone (0 STA).
 	 */
 	if (type != NL80211_IFTYPE_MONITOR)
 		return 0;
-
-	/* Force-enable: FW reports no support but we try anyway */
-	//if (!sme_IsFeatureSupportedByFW(STA_MONITOR_SCC)) {
-	//	hddLog(LOGE, FL("No FW support for STA + MON SCC"));
-	//	return -EINVAL;
-	//}
 
 	if (hdd_ctx->no_of_open_sessions[VOS_MONITOR_MODE]) {
 		hddLog(VOS_TRACE_LEVEL_ERROR,
@@ -2217,27 +2210,28 @@ wlan_hdd_add_monitor_check(hdd_context_t *hdd_ctx, hdd_adapter_t **adapter,
 		return -EBUSY;
 	}
 
-	/* Ensure there is only one station interface */
-	if (hdd_ctx->no_of_open_sessions[VOS_STA_MODE] != 1) {
+	/* Allow 0 or 1 STA interfaces (standalone or STA+MON) */
+	if (hdd_ctx->no_of_open_sessions[VOS_STA_MODE] > 1) {
 		hddLog(LOGE,
 		 FL("cannot add monitor mode, due to %u sta interfaces"),
 		 hdd_ctx->no_of_open_sessions[VOS_STA_MODE]);
-
 		return -EINVAL;
 	}
 
-	sta_adapter = hdd_get_adapter(hdd_ctx, WLAN_HDD_INFRA_STATION);
-	if (!sta_adapter) {
-		hddLog(LOGE, FL("No station adapter"));
-		return -EINVAL;
-	}
+	if (hdd_ctx->no_of_open_sessions[VOS_STA_MODE] == 1) {
+		sta_adapter = hdd_get_adapter(hdd_ctx, WLAN_HDD_INFRA_STATION);
+		if (!sta_adapter) {
+			hddLog(LOGE, FL("No station adapter"));
+			return -EINVAL;
+		}
 
-	/* delete all the other interfaces */
-	for (i = VOS_STA_SAP_MODE; i <= VOS_P2P_DEVICE; i++) {
-		if (i == VOS_FTM_MODE || i == VOS_MONITOR_MODE)
-			continue;
+		/* delete all the other interfaces */
+		for (i = VOS_STA_SAP_MODE; i <= VOS_P2P_DEVICE; i++) {
+			if (i == VOS_FTM_MODE || i == VOS_MONITOR_MODE)
+				continue;
 
-		hdd_close_all_adapters_per_mode(hdd_ctx, i);
+			hdd_close_all_adapters_per_mode(hdd_ctx, i);
+		}
 	}
 
 	mon_adapter = hdd_open_adapter(hdd_ctx, WLAN_HDD_MONITOR, name,

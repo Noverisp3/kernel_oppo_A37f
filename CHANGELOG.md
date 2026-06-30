@@ -1,5 +1,21 @@
 # Cinnamon Kernel Changelog
 
+## Build #379
+
+### WLAN Monitor Mode — Full Driver Support (2026-06-30)
+
+- **Standalone monitor mode:** Removed STA requirement in `wlan_hdd_add_monitor_check()` — now allows 0 or 1 STA interfaces
+- **Forced FW capability bit:** `setFeatCaps(gpFwWlanFeatCaps, STA_MONITOR_SCC)` in `WDI_ProcessFeatureCapsExchangeRsp()` to make host think FW supports it
+- **cfg80211 set_channel for MONITOR:** Added `WLAN_HDD_MONITOR` case in `__wlan_hdd_cfg80211_set_channel()` that:
+  - Updates monitor context with channel, BW=20, CRC=off, all frame types
+  - Sets `dev->type = ARPHRD_IEEE80211_RADIOTAP`
+  - Sets `pMonCtx->state = MON_MODE_START`
+  - Sends `WDA_MON_START_REQ` to firmware via `wlan_hdd_mon_postMsg()`
+  - Waits up to 5s for firmware response
+  - Enables carrier on success
+- **Standalone open fix:** `__hdd_mon_open()` now sets `DEVICE_IFACE_OPENED` even when not in `VOS_STA_MON` mode
+- Usage: `iw phy phy0 interface add mon0 type monitor && ifconfig mon0 up && iw dev mon0 set freq 2412 && tcpdump -i mon0`
+
 ## Build #378
 
 ### WLAN Monitor Mode — Force-enable (2026-06-30)

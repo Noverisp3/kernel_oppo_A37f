@@ -9989,9 +9989,9 @@ VOS_STATUS wlan_hdd_validate_operation_channel(hdd_adapter_t *pAdapter,int chann
  * This function is used to set the channel number
  */
 static int __wlan_hdd_cfg80211_set_channel( struct wiphy *wiphy, struct net_device *dev,
-                                   struct ieee80211_channel *chan,
-                                   enum nl80211_channel_type channel_type
-                                 )
+                                    struct ieee80211_channel *chan,
+                                    enum nl80211_channel_type channel_type
+                                  )
 {
     hdd_adapter_t *pAdapter = NULL;
     v_U32_t num_ch = 0;
@@ -10046,7 +10046,8 @@ static int __wlan_hdd_cfg80211_set_channel( struct wiphy *wiphy, struct net_devi
     num_ch = WNI_CFG_VALID_CHANNEL_LIST_LEN;
 
     if ((WLAN_HDD_SOFTAP != pAdapter->device_mode) &&
-       (WLAN_HDD_P2P_GO != pAdapter->device_mode))
+       (WLAN_HDD_P2P_GO != pAdapter->device_mode) &&
+       (WLAN_HDD_MONITOR != pAdapter->device_mode))
     {
         if(VOS_STATUS_SUCCESS != wlan_hdd_validate_operation_channel(pAdapter,channel))
         {
@@ -10122,6 +10123,56 @@ static int __wlan_hdd_cfg80211_set_channel( struct wiphy *wiphy, struct net_devi
                 (WLAN_HDD_GET_AP_CTX_PTR(pAdapter))->sapConfig.channel = channel;
             }
         }
+    }
+    else if (pAdapter->device_mode == WLAN_HDD_MONITOR)
+    {
+        v_CONTEXT_t pVosContext;
+        hdd_mon_ctx_t *pMonCtx;
+        v_U32_t magic;
+        struct completion cmpVar;
+        long waitRet;
+
+        pMonCtx = WLAN_HDD_GET_MONITOR_CTX_PTR(pAdapter);
+        if (!pMonCtx) {
+            hddLog(VOS_TRACE_LEVEL_FATAL,
+                   "%s: Monitor context is null", __func__);
+            return -EINVAL;
+        }
+
+        pMonCtx->ChannelNo = channel;
+        pMonCtx->ChannelBW = 20;
+        pMonCtx->crcCheckEnabled = 0;
+        wlan_hdd_mon_set_typesubtype(pMonCtx, 100);
+        pMonCtx->is80211to803ConReq = 0;
+
+        pVosContext = vos_get_global_context(VOS_MODULE_ID_SYS, NULL);
+        if (pVosContext)
+            WLANTL_SetIsConversionReq(pVosContext, 0);
+
+        dev->type = ARPHRD_IEEE80211_RADIOTAP;
+
+        pMonCtx->state = MON_MODE_START;
+        magic = MON_MODE_MSG_MAGIC;
+        init_completion(&cmpVar);
+        if (VOS_STATUS_SUCCESS !=
+                wlan_hdd_mon_postMsg(&magic, &cmpVar,
+                                      pMonCtx, hdd_monPostMsgCb)) {
+            VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                        FL("failed to post MON MODE REQ"));
+            magic = 0;
+            return -EIO;
+        }
+        waitRet = wait_for_completion_timeout(&cmpVar,
+                                           MON_MODE_MSG_TIMEOUT);
+        if (waitRet <= 0) {
+            VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_WARN,
+                FL("MON MODE REQ wait timed out %ld"), waitRet);
+        }
+
+        netif_carrier_on(dev);
+
+        hddLog(VOS_TRACE_LEVEL_INFO_HIGH,
+               "%s: monitor mode started on channel %d", __func__, channel);
     }
     else
     {
@@ -21415,6 +21466,62 @@ static int wlan_hdd_cfg80211_channel_switch(struct wiphy *wiphy,
 }
 #endif
 
+static int wlan_hdd_cfg80211_set_monitor_channel(struct wiphy *wiphy,
+                                                struct cfg80211_chan_def *chandef)
+{
+    hdd_context_t *pHddCtx;
+    hdd_adapter_t *pAdapter;
+    hdd_mon_ctx_t *pMonCtx;
+    v_CONTEXT_t pVosContext;
+    v_U32_t channel;
+    int status = 0;
+
+    pHddCtx = wiphy_priv(wiphy);
+    if (!pHddCtx) {
+        hddLog(VOS_TRACE_LEVEL_FATAL, "%s: HDD context null", __func__);
+        return -EINVAL;
+    }
+
+    pAdapter = hdd_get_adapter(pHddCtx, WLAN_HDD_MONITOR);
+    if (!pAdapter) {
+        hddLog(VOS_TRACE_LEVEL_FATAL, "%s: Monitor adapter not found", __func__);
+        return -ENODEV;
+    }
+
+    channel = vos_freq_to_chan(chandef->chan->center_freq);
+    if (channel == 0) {
+        hddLog(VOS_TRACE_LEVEL_ERROR, "%s: Invalid frequency %d",
+               __func__, chandef->chan->center_freq);
+        return -EINVAL;
+    }
+
+    pMonCtx = WLAN_HDD_GET_MONITOR_CTX_PTR(pAdapter);
+    if (!pMonCtx) {
+        hddLog(VOS_TRACE_LEVEL_FATAL, "%s: Monitor context null", __func__);
+        return -EINVAL;
+    }
+
+    pMonCtx->ChannelNo = channel;
+    pMonCtx->ChannelBW = 20;
+    pMonCtx->crcCheckEnabled = 0;
+    wlan_hdd_mon_set_typesubtype(pMonCtx, 100);
+    pMonCtx->is80211to803ConReq = 0;
+
+    pVosContext = vos_get_global_context(VOS_MODULE_ID_SYS, NULL);
+    if (pVosContext)
+        WLANTL_SetIsConversionReq(pVosContext, 0);
+
+    pAdapter->dev->type = ARPHRD_IEEE80211_RADIOTAP;
+
+    pMonCtx->state = MON_MODE_START;
+    netif_carrier_on(pAdapter->dev);
+
+    hddLog(VOS_TRACE_LEVEL_INFO_HIGH,
+           "%s: monitor mode started on channel %d", __func__, channel);
+
+    return status;
+}
+
 /* cfg80211_ops */
 static struct cfg80211_ops wlan_hdd_cfg80211_ops =
 {
@@ -21439,6 +21546,7 @@ static struct cfg80211_ops wlan_hdd_cfg80211_ops =
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0))
     .set_channel = wlan_hdd_cfg80211_set_channel,
 #endif
+    .set_monitor_channel = wlan_hdd_cfg80211_set_monitor_channel,
     .scan = wlan_hdd_cfg80211_scan,
     .connect = wlan_hdd_cfg80211_connect,
     .disconnect = wlan_hdd_cfg80211_disconnect,

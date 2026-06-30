@@ -30936,7 +30936,9 @@ WDI_ProcessFeatureCapsExchangeRsp
    -------------------------------------------------------------------------*/
 
    wpalMemoryCopy(gpFwWlanFeatCaps,(tWlanFeatCaps *) pEventData -> pEventData,
-                    fCapsStructSize);
+                     fCapsStructSize);
+   /* Force-enable STA_MONITOR_SCC - FW may not report it but we need it */
+   setFeatCaps(gpFwWlanFeatCaps, STA_MONITOR_SCC);
    WPAL_TRACE( eWLAN_MODULE_DAL_CTRL,  eWLAN_PAL_TRACE_LEVEL_INFO,
       "FW caps %x %x %x %x",
       gpFwWlanFeatCaps->featCaps[0],

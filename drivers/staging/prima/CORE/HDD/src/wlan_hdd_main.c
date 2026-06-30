@@ -7278,8 +7278,10 @@ int __hdd_mon_open (struct net_device *dev)
       return -EINVAL;
    }
 
-   if (vos_get_concurrency_mode() != VOS_STA_MON)
+   if (vos_get_concurrency_mode() != VOS_STA_MON) {
+       set_bit(DEVICE_IFACE_OPENED, &pAdapter->event_flags);
        return 0;
+   }
 
    hdd_ctx = WLAN_HDD_GET_CTX(pAdapter);
    if (wlan_hdd_validate_context(hdd_ctx))
@@ -9356,12 +9358,8 @@ bool wlan_hdd_check_monitor_state(hdd_context_t *hdd_ctx)
 	hdd_adapter_t *mon_adapter;
 	hdd_mon_ctx_t *mon_ctx;
 
-	if (hdd_ctx->concurrency_mode != VOS_STA_MON)
-		return false;
-
 	mon_adapter = hdd_get_adapter(hdd_ctx, WLAN_HDD_MONITOR);
 	if (!mon_adapter) {
-		hddLog(LOGE, FL("Invalid concurrency mode"));
 		return false;
 	}
 
