@@ -9319,33 +9319,7 @@ int wlan_hdd_stop_mon(hdd_context_t *hdd_ctx, bool wait)
 		return 0;
 
 	mon_ctx->state = MON_MODE_STOP;
-	if (wait) {
-		func_ptr = hdd_monPostMsgCb;
-		magic = MON_MODE_MSG_MAGIC;
-		init_completion(&cmp_var);
-	}
 
-	if (VOS_STATUS_SUCCESS != wlan_hdd_mon_postMsg(&magic, &cmp_var,
-						       mon_ctx,
-						       hdd_monPostMsgCb)) {
-		hddLog(LOGE, FL("failed to stop MON MODE"));
-		mon_ctx->state = MON_MODE_START;
-		magic = 0;
-		return -EINVAL;
-	}
-
-	if (!wait)
-		goto bmps_roaming;
-
-	ret = wait_for_completion_timeout(&cmp_var, MON_MODE_MSG_TIMEOUT);
-	magic = 0;
-	if (ret <= 0 ) {
-		hddLog(LOGE,
-			FL("timeout on stop monitor mode completion %ld"), ret);
-		return -EINVAL;
-	}
-
-bmps_roaming:
 	hddLog(LOG1, FL("Enable BMPS"));
 	hdd_enable_bmps_imps(hdd_ctx);
 	hdd_restore_roaming(hdd_ctx);
