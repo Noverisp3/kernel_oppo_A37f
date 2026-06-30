@@ -2203,10 +2203,11 @@ wlan_hdd_add_monitor_check(hdd_context_t *hdd_ctx, hdd_adapter_t **adapter,
 	if (type != NL80211_IFTYPE_MONITOR)
 		return 0;
 
-	if (!sme_IsFeatureSupportedByFW(STA_MONITOR_SCC)) {
-		hddLog(LOGE, FL("No FW support for STA + MON SCC"));
-		return -EINVAL;
-	}
+	/* Force-enable: FW reports no support but we try anyway */
+	//if (!sme_IsFeatureSupportedByFW(STA_MONITOR_SCC)) {
+	//	hddLog(LOGE, FL("No FW support for STA + MON SCC"));
+	//	return -EINVAL;
+	//}
 
 	if (hdd_ctx->no_of_open_sessions[VOS_MONITOR_MODE]) {
 		hddLog(VOS_TRACE_LEVEL_ERROR,

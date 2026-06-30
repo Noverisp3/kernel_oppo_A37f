@@ -1,5 +1,13 @@
 # Cinnamon Kernel Changelog
 
+## Build #378
+
+### WLAN Monitor Mode — Force-enable (2026-06-30)
+
+- **Pronto WCNSS driver:** Removed FW capability check (`sme_IsFeatureSupportedByFW(STA_MONITOR_SCC)`) in `wlan_hdd_add_monitor_check()` to allow `iw` to create a monitor interface
+- Previously driver returned `-EINVAL` because WCNSS firmware doesn't report `STA_MONITOR_SCC` support
+- May not capture frames if firmware doesn't implement monitor data path — test required
+
 ## Build #376 — Reverted
 
 ### eMMC HS400 + SD Card DDR50 — Failed (2026-06-30)
