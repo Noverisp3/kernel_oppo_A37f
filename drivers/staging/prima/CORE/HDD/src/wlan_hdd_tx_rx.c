@@ -2586,29 +2586,37 @@ VOS_STATUS  hdd_rx_packet_monitor_cbk(v_VOID_t *vosContext,vos_pkt_t *pVosPacket
     }
 
    ++pAdapter->hdd_stats.hddTxRxStats.rxChains;
-   status = vos_pkt_get_os_packet( pVosPacket, (v_VOID_t **)&skb, VOS_TRUE );
-   if(!VOS_IS_STATUS_SUCCESS( status ))
-    {
-        ++pAdapter->hdd_stats.hddTxRxStats.rxDropped;
-        VOS_TRACE( VOS_MODULE_ID_HDD_DATA, VOS_TRACE_LEVEL_ERROR,
-                               "%s: Failure extracting skb from vos pkt", __func__);
-        vos_pkt_return_packet( pVosPacket );
-        return VOS_STATUS_E_FAILURE;
-    }
 
-    if(vos_get_conparam() != VOS_MONITOR_MODE)
-    {
-        struct sk_buff *orig_skb = skb;
-        skb = skb_clone(orig_skb, GFP_ATOMIC);
-        if (!skb)
-        {
-            VOS_TRACE(VOS_MODULE_ID_HDD_DATA, VOS_TRACE_LEVEL_ERROR,
-                      "%s: skb_clone failed", __func__);
-            pVosPacket->pSkb = orig_skb;
-            return VOS_STATUS_E_FAILURE;
-        }
-        pVosPacket->pSkb = orig_skb;
-    }
+   if (vos_get_conparam() == VOS_MONITOR_MODE)
+   {
+       status = vos_pkt_get_os_packet(pVosPacket, (v_VOID_t **)&skb, VOS_TRUE);
+       if (!VOS_IS_STATUS_SUCCESS(status))
+       {
+           ++pAdapter->hdd_stats.hddTxRxStats.rxDropped;
+           VOS_TRACE(VOS_MODULE_ID_HDD_DATA, VOS_TRACE_LEVEL_ERROR,
+                     "%s: Failure extracting skb", __func__);
+           vos_pkt_return_packet(pVosPacket);
+           return VOS_STATUS_E_FAILURE;
+       }
+   }
+   else
+   {
+       status = vos_pkt_get_os_packet(pVosPacket, (v_VOID_t **)&skb, VOS_FALSE);
+       if (!VOS_IS_STATUS_SUCCESS(status) || !skb)
+       {
+           ++pAdapter->hdd_stats.hddTxRxStats.rxDropped;
+           VOS_TRACE(VOS_MODULE_ID_HDD_DATA, VOS_TRACE_LEVEL_ERROR,
+                     "%s: Failure peeking skb", __func__);
+           return VOS_STATUS_SUCCESS;
+       }
+       skb = skb_copy(skb, GFP_ATOMIC);
+       if (!skb)
+       {
+           VOS_TRACE(VOS_MODULE_ID_HDD_DATA, VOS_TRACE_LEVEL_ERROR,
+                     "%s: skb_copy failed", __func__);
+           return VOS_STATUS_SUCCESS;
+       }
+   }
 
     if(!conversion)
     {
@@ -2637,20 +2645,18 @@ VOS_STATUS  hdd_rx_packet_monitor_cbk(v_VOID_t *vosContext,vos_pkt_t *pVosPacket
        ++pAdapter->hdd_stats.hddTxRxStats.rxRefused;
     }
 
-   if (vos_get_conparam() != VOS_MONITOR_MODE)
+   if (vos_get_conparam() == VOS_MONITOR_MODE)
    {
-       pAdapter->dev->last_rx = jiffies;
-       return VOS_STATUS_SUCCESS;
-   }
-
-   status = vos_pkt_return_packet( pVosPacket );
-   if(!VOS_IS_STATUS_SUCCESS( status ))
-   {
-      VOS_TRACE( VOS_MODULE_ID_HDD_DATA, VOS_TRACE_LEVEL_ERROR,"%s: Failure returning vos pkt", __func__);
+       status = vos_pkt_return_packet(pVosPacket);
+       if (!VOS_IS_STATUS_SUCCESS(status))
+       {
+           VOS_TRACE(VOS_MODULE_ID_HDD_DATA, VOS_TRACE_LEVEL_ERROR,
+                     "%s: Failure returning vos pkt", __func__);
+       }
    }
    pAdapter->dev->last_rx = jiffies;
 
-return status;
+return VOS_STATUS_SUCCESS;
 }
 
 bool hdd_is_duplicate_ip_arp(struct sk_buff *skb)
