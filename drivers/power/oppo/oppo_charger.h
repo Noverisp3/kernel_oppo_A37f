@@ -123,6 +123,7 @@ OPPO_CHARGER_EXT void opchg_set_fast_chg_current(struct opchg_charger *chip, int
 OPPO_CHARGER_EXT void opchg_set_float_voltage(struct opchg_charger *chip, int mV);
 OPPO_CHARGER_EXT void opchg_set_charging_disable(struct opchg_charger *chip, bool disable);
 OPPO_CHARGER_EXT void opchg_set_suspend_enable(struct opchg_charger *chip, bool enable);
+OPPO_CHARGER_EXT void opchg_set_bypass(struct opchg_charger *chip, bool enable);
 OPPO_CHARGER_EXT int opchg_hw_init(struct opchg_charger *chip);
 OPPO_CHARGER_EXT int opchg_get_initial_state(struct opchg_charger *chip);
 OPPO_CHARGER_EXT void opchg_set_wdt_reset(struct opchg_charger *chip);

@@ -1492,6 +1492,11 @@ void opchg_check_status(struct opchg_charger *chip)
     chip->charger_vol = opchg_get_prop_charger_voltage_now(chip);
     chip->bat_volt_check_point = opchg_get_prop_batt_capacity(chip);
 
+	if (chip->bat_volt_check_point >= 90 && chip->chg_present && !chip->bypass)
+		opchg_set_bypass(chip, true);
+	else if (chip->bypass && (!chip->chg_present || chip->bat_volt_check_point < 85))
+		opchg_set_bypass(chip, false);
+
 	chip->charger_type = qpnp_charger_type_get(chip);
 
 	count_debug++;

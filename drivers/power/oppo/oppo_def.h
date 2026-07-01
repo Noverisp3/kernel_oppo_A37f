@@ -114,6 +114,7 @@ enum {
     CHAGER_VOOC_DISABLE = BIT(6),
     CHAGER_TIMEOUT_DISABLE = BIT(7),
     CHAGER_RECHARGER_DISABLE = BIT(8),
+    BYPASS_DISABLE = BIT(9),
 };
 
 enum {
@@ -293,9 +294,10 @@ struct opchg_charger {
 	int								non_standard_vfloat_mv;
 	int								non_standard_fastchg_current_ma;
 
-	int								check_term_voltage_count;
+	int                             check_term_voltage_count;
 	int                             pre_full_term_vfloat_mv;
 	int								vfloat_new;
+	bool                            bypass;
 
 
     struct regulator*               vcc_i2c;

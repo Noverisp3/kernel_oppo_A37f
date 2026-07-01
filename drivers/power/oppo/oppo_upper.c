@@ -52,6 +52,7 @@ static enum power_supply_property opchg_battery_properties[] = {
 	POWER_SUPPLY_PROP_BATTERY_CHARGER_ENABLE,//dengnw add for charger enable for MMI test
 	POWER_SUPPLY_PROP_BATTERY_NOTIFY,		//dengnw add for charging status
 	POWER_SUPPLY_PROP_POWER_OFF,			//lfc add for power_off when vbatt is low
+	POWER_SUPPLY_PROP_BYPASS,
 };
 
 static enum power_supply_property pm_power_props_mains[] = {
@@ -335,6 +336,7 @@ int opchg_batt_property_is_writeable(struct power_supply *psy,
     case POWER_SUPPLY_PROP_CHARGING_ENABLED:
     case POWER_SUPPLY_PROP_CAPACITY:
 	case POWER_SUPPLY_PROP_BATTERY_CHARGER_ENABLE:
+	case POWER_SUPPLY_PROP_BYPASS:
         return 1;
     default:
         break;
@@ -406,6 +408,10 @@ int opchg_battery_set_property(struct power_supply *psy,
 			}
 			opchg_config_charging_disable(chip, FACTORY_MODE_DISABLE, 1);
 		}
+        break;
+
+    case POWER_SUPPLY_PROP_BYPASS:
+        opchg_set_bypass(chip, !!val->intval);
         break;
 
     default:
@@ -655,6 +661,10 @@ int opchg_battery_get_property(struct power_supply *psy,
 
 		case POWER_SUPPLY_PROP_POWER_OFF:
 			val->intval = 0;
+			break;
+
+		case POWER_SUPPLY_PROP_BYPASS:
+			val->intval = chip->bypass ? 1 : 0;
 			break;
 
 	    default:

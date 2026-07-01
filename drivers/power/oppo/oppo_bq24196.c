@@ -654,6 +654,12 @@ void bq24196_set_batfet_off(struct opchg_charger *chip)
 		opchg_masked_write(chip, REG07_BQ24196_ADDRESS, REG07_BQ24196_BATFET_MASK, REG07_BQ24196_BATFET_OFF);
 }
 
+void bq24196_set_batfet_on(struct opchg_charger *chip)
+{
+	if (chip != NULL)
+		opchg_masked_write(chip, REG07_BQ24196_ADDRESS, REG07_BQ24196_BATFET_MASK, 0);
+}
+
 int bq24196_set_vindpm_vol(struct opchg_charger *chip, int vol)
 {
 	int rc;
@@ -778,6 +784,9 @@ int bq24196_hw_init(struct opchg_charger *chip)
 	/* compenstion voltage setting */
 	rc = bq24196_set_compenstion_voltage(chip, REG06_BQ24196_COMPENSATION_VOLTAGE_112MV);
 	#endif
+
+	/* always turn BATFET back on during init (in case it was left off by bypass) */
+	bq24196_set_batfet_on(chip);
 
     return rc;
 }

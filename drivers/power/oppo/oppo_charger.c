@@ -894,6 +894,20 @@ void opchg_set_suspend_enable(struct opchg_charger *chip, bool enable)
     }
 }
 
+void opchg_set_bypass(struct opchg_charger *chip, bool enable)
+{
+	chip->bypass = enable;
+	switch (chip->driver_id) {
+	case OPCHG_BQ24196_ID:
+		opchg_config_charging_disable(chip, BYPASS_DISABLE, enable);
+		opchg_set_wdt_reset(chip);
+		break;
+	default:
+		dev_err(chip->dev, "bypass not supported on this charger\n");
+		break;
+	}
+}
+
 int opchg_hw_init(struct opchg_charger *chip)
 {
     int rc = 0;

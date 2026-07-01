@@ -228,6 +228,7 @@ static struct device_attribute power_supply_attrs[] = {
 	POWER_SUPPLY_ATTR(charger_enable),
 	POWER_SUPPLY_ATTR(BatteryNotify),
 	POWER_SUPPLY_ATTR(power_off),
+	POWER_SUPPLY_ATTR(bypass),
 #endif
 	POWER_SUPPLY_ATTR(flash_current_max),
 	POWER_SUPPLY_ATTR(update_now),

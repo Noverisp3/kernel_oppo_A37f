@@ -1,5 +1,17 @@
 # Cinnamon Kernel Changelog
 
+## Builds #389–#402
+
+### BQ24196 Bypass Charging + Real Current + Voltage SOC Fix (2026-07-01)
+
+- **Build #389–#392:** `POWER_SUPPLY_PROP_BYPASS` sysfs (`/sys/class/power_supply/battery/bypass`). Safe bypass: disable charging only via `opchg_config_charging_disable(BYPASS_DISABLE)` — BATFET stays ON so system runs from USB via NVDC, battery supplements when load > input limit, seamless takeover on USB disconnect
+- **Build #393:** Voltage-based SOC fallback when VM-BMS returns 0%: `(vol_uV - 3300000) / 10000`, cap 90%
+- **Build #394:** Bypass uses OPPO multi-reason charging disable framework with `BYPASS_DISABLE = BIT(9)`. Verified REG01 bit 4 toggles (0x1b→0x0b), REG08 bit 5 clears (FAST_CHARGING→NO_CHARGING)
+- **Build #395–#396:** Replaced hardcoded `CURRENT_NOW = -450` with real estimation from BQ24196 REG02 charge current limit: `((reg02 >> 2) + 1) * 64 mA`, capped by `max_input_current[INPUT_CURRENT_MIN] - 150 mA`. Reports ~350 mA on PC USB, ~1050 mA on 1.5A wall charger
+- **Build #398–#400:** VM-BMS always returns `CAPACITY = 0` — override with voltage estimate divisor `/9000` (4.2V → 100%, cap 99%). Charging sync: increment SOC every 35s when voltage > 4.1V. Discharging: only decrement when voltage < 3.3V (prevented false drops but caused SOC freeze)
+- **Build #401:** Auto-bypass — when `capacity ≥ 90%` AND charger present, auto-enable bypass; disable bypass when `capacity < 85%` OR charger removed. Hysteresis 5% avoids rapid toggling
+- **Build #402:** Fixed SOC freeze during discharge — BMS always returns 0, so `soc_bms < bat_volt_check_point` condition was never true. Added voltage-based SOC comparison fallback: calculate `volt_soc = (vol_uV - 3300000) / 9000` and decrement when `volt_soc < bat_volt_check_point`. SOC now drops gradually based on voltage during stress test
+
 ## Builds #387–#388
 
 ### Monitor TX Injection Test — Redirect mon0 → wlan0 hdd_hard_start_xmit (2026-06-30)
@@ -336,3 +348,7 @@
 - Sound Control (faux, increase max volume)
 - ZRAM 1GB + lz4/zstd
 - Input boost duration 40ms→80ms
+
+## Current Problems
+- Battery % during discharge is voltage-estimated, not measured — no hardware current sensor on this device (BQ24196 has no current ADC, no BQ27541 fuel gauge, VM-BMS IADC driver not present). Discharge current hardcoded at -450 mA
+- Black screen if battery drop below 20% (not sure/user report)
